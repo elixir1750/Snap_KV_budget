@@ -41,7 +41,6 @@ def snapkv_forward_wrapper(self, *args, **kwargs):
     return outputs
 
 def apply_snapkv_to_model(model):
-
     print("\n正在直接向模型实例注入 SnapKV 补丁...")
     for i, layer in enumerate(model.gpt_neox.layers):
         attn_module = layer.attention
@@ -49,5 +48,16 @@ def apply_snapkv_to_model(model):
             attn_module._original_forward = attn_module.forward
         attn_module.forward = snapkv_forward_wrapper.__get__(attn_module, type(attn_module))
         attn_module.layer_idx = i
-        
-    print(f"成功为 {len(model.gpt_neox.layers)} 个 Attention 层注入了补丁！\n")
+    original_prepare = model.prepare_inputs_for_generation
+    
+    def custom_prepare_inputs(*args, **kwargs):
+        model_inputs = original_prepare(*args, **kwargs)
+        if "past_key_values" in kwargs and kwargs["past_key_values"] is not None:
+            if "attention_mask" in kwargs:
+                true_seq_len = kwargs["attention_mask"].shape[-1]
+                position_ids = torch.tensor([[true_seq_len - 1]], dtype=torch.long, device=model.device)
+                model_inputs["position_ids"] = position_ids
+        return model_inputs
+    model.prepare_inputs_for_generation = custom_prepare_inputs.__get__(model, type(model))
+    
+    print(f"成功为 {len(model.gpt_neox.layers)} 个 Attention 层和 Generation 机制注入了补丁！\n")

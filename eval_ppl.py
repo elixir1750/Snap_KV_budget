@@ -60,15 +60,11 @@ def evaluate_ppl_on_sample(model, tokenizer, text_chunk, prefill_len=500, eval_l
     with torch.no_grad():
         outputs = model(prefill_ids, use_cache=True, output_attentions=True)
         past_kv = outputs.past_key_values
-        attentions = outputs.attentions
+        
+        true_seq_len = prefill_ids.shape[1]
         
         if use_snapkv:
-            print(f"\n[!!!] 触发 SnapKV 压缩 | 原始长度: {past_kv.get_seq_length()}")
-            past_kv = manual_snapkv_compress(past_kv, attentions, max_capacity=64)
-
-            print(f"--> 压缩后对象长度确认: {past_kv.get_seq_length()}")
-        else:
-            print(f"\nBaseline 模式 | 长度保持: {past_kv.get_seq_length()}")
+            past_kv = manual_snapkv_compress(past_kv, outputs.attentions, max_capacity=64)
 
         next_token_logit = outputs.logits[:, -1, :]
 
@@ -76,13 +72,22 @@ def evaluate_ppl_on_sample(model, tokenizer, text_chunk, prefill_len=500, eval_l
             target_token = eval_ids[:, i]
             loss = loss_fct(next_token_logit, target_token)
             nlls.append(loss.item())
+
+            device = target_token.device
+            current_position_ids = torch.tensor([[true_seq_len]], dtype=torch.long, device=device)
             
-            out = model(target_token.unsqueeze(0), past_key_values=past_kv, use_cache=True)
+            out = model(
+                target_token.unsqueeze(0), 
+                past_key_values=past_kv, 
+                position_ids=current_position_ids,
+                use_cache=True
+            )
             past_kv = out.past_key_values
             next_token_logit = out.logits[:, -1, :]
             
+            true_seq_len += 1
+            
     return math.exp(sum(nlls) / len(nlls))
-
 def main():
     USE_SNAPKV = True
     
