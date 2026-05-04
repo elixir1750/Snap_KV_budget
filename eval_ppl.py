@@ -64,7 +64,7 @@ def evaluate_ppl_on_sample(model, tokenizer, text_chunk, prefill_len=500, eval_l
         
         if use_snapkv:
             print(f"\n[!!!] 触发 SnapKV 压缩 | 原始长度: {past_kv.get_seq_length()}")
-            past_kv = manual_snapkv_compress(past_kv, attentions, max_capacity=512)
+            past_kv = manual_snapkv_compress(past_kv, attentions, max_capacity=64)
 
             print(f"--> 压缩后对象长度确认: {past_kv.get_seq_length()}")
         else:
