@@ -1,64 +1,262 @@
-# SnapKV-Pythia: 语言模型高效推理 (逐层 KV Cache 压缩)
+# PyramidSinkKV for Pythia-70M
 
-本项目为 **上海交通大学 NLP 课程大作业** 的个人部分实现。我们针对 `Pythia-70M` 模型实现了 **SnapKV** 算法，通过逐层 KV Cache 压缩技术，在不改变模型参数且无需微调的情况下，探索推理效率与模型性能之间的权衡。
+This repository implements a training-free KV cache compression method for
+`EleutherAI/pythia-70m` and `EleutherAI/pythia-70m-deduped`.  The backbone model
+weights are never updated.  All changes happen at inference time by compressing
+GPTNeoX/Pythia `past_key_values` after prefill.
 
-## 项目亮点
-- **算法实现**：完整复现了 SnapKV 核心逻辑，包含观察窗口（Observation Window）、基于池化的注意力热点选择（Heavy Hitter Selection）及起始词保护（Attention Sinks）。
-- **底层机制修复（RoPE 对齐）**：深度分析并修复了 KV Cache 长度截断后导致的 HuggingFace 底层 RoPE（旋转位置编码）Position ID 错位问题，成功挽救了压缩后的性能崩塌。
-- **通用适配**：通过包装器（Wrapper）模式注入模型补丁，完美兼容 HuggingFace `transformers` 库的最新 `DynamicCache` 结构。
-- **环境友好**：支持纯 CPU 推理，代码经过优化，可在普通笔记本上完成全量评测。
+The project includes:
 
-## 文件组织
-- `snapkv_utils.py`: 核心算法库，包含注意力分数平滑处理与 Top-K 索引选择逻辑。
-- `modify_gptneox.py`: 模型注入补丁，通过实例拦截技术向 `GPTNeoX` 架构注入压缩逻辑与位置编码对齐逻辑。
-- `eval_ppl.py`: 自动化评测脚本，支持在 `Wikitext-2` 数据集上进行不同容量的 PPL 对比测试。
-- `benchmark_speed.py`: 速度与加速比评测脚本，支持 TTFT、TPOT 和 Throughput 测试。
-- `demo.py`: 推理演示脚本，展示压缩开启后的长文本生成效果。
-- `requirements.txt`: 项目依赖清单。
+- dense generation baseline with no KV compression
+- no-cache baseline with `use_cache=False`
+- random KV baseline
+- uniform SnapKV-style budget
+- PyramidSinkKV with random, key-norm, or attention-score token selection
+- reversed-pyramid, spindle, hourglass, no-sink, and no-recent-window ablations
+- generation speed benchmark, PPL evaluation, ablation table generation, and a terminal streaming demo
 
-## 实验结果 (Wikitext-2)
+## Setup
 
-### 1. 精度评测 (PPL)
-我们在 `wikitext-2-raw-v1` 测试集上对 `Pythia-70M` 进行了不同 KV 缓存容量（Max Capacity）的对比实验（Prompt 长度 $\approx$ 500 tokens）。
-
-| 配置 (Configuration) | KV 容量 | 压缩率 (约) | 平均 PPL |
-| :--- | :---: | :---: | :---: |
-| **Baseline (Full)** | **~500** | **0%** | **50.23** |
-| SnapKV-512 | 512 | 0% | 50.23 |
-| SnapKV-256 | 256 | 48.8% | 52.40 |
-| SnapKV-128 | 128 | 74.4% | 61.60 |
-| SnapKV-64 | 64 | 87.2% | 69.37 |
-
-### 2. 加速与吞吐量评测
-我们在 CPU 环境下对长文本生成任务（Prompt 长度 $\approx$ 1000 tokens，生成 50 tokens）进行了效率测试。SnapKV 设定容量为 64。
-
-| 指标 | Baseline | SnapKV | 提升比 |
-| :--- | :---: | :---: | :---: |
-| **TTFT** (Time To First Token, 首字延迟) | 2.7099 s | 2.3970 s | **1.13x** |
-| **TPOT** (Time Per Output Token, 逐字延迟) | 0.0363 s | 0.0242 s | **1.50x** |
-| **Throughput** (吞吐量, tokens/s) | 11.1393 | 13.9490 | **1.25x** |
-
-## 结果与效益分析
-1. **逻辑正确性验证**：当容量设为 512（略大于 Prompt 长度）时，PPL 与 Baseline 保持完全一致（均为 50.23），证明算法在无损状态下的实现逻辑完全正确，未引入额外计算误差。
-2. **极强的压缩鲁棒性（克服 RoPE 错位）**：在修复了 RoPE 位置编码错位问题后，SnapKV 展现出了惊人的效率-性能平衡。即使在压缩率接近 50%（Capacity=256）时，PPL 仅发生微小波动（50.23 $\rightarrow$ 52.40）。这强有力地证明了 SnapKV 提取“注意力热点”的策略能够精准保留关键上下文。
-3. **极限压缩下的平滑退化**：即使在保留容量仅为 64（压缩率超 87%）的极端情况下，PPL 也只是平滑退化至 69.37，且模型仍能输出连贯的文本，这大大优越于早期未对齐位置编码时的崩塌现象。
-4. **显著的生成提速与显存节省**：在生成阶段（Decoding），由于 KV Cache 被恒定压缩在 64，无需再计算和扫描全量的长文本缓存，单字生成延迟（TPOT）大幅缩短，实现了 **1.50 倍** 的推理加速（Throughput 吞吐量提升了 **1.25 倍**）。同时，KV Cache 的显存开销**降低超过 85%**，极大缓解了长序列推理的显存瓶颈。
-
-## 快速上手
-
-### 1. 安装依赖
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
-### 2. 推理演示
+
+The code uses HuggingFace APIs directly, so mirror settings are handled through
+standard environment variables.  For example:
+
 ```bash
-python demo.py
+export HF_ENDPOINT=https://hf-mirror.com
 ```
-### 3. PPL 评测
+
+Then load either:
+
 ```bash
-python eval_ppl.py
+EleutherAI/pythia-70m
+EleutherAI/pythia-70m-deduped
 ```
-### 4. 速度基准测试
+
+## Method
+
+`pyramidsinkkv.py` contains the core implementation.  For each layer, it computes
+a keep budget, always preserves sink tokens and recent tokens, selects remaining
+middle tokens, and gathers KV tensors in their original order.
+
+Expected GPTNeoX/Pythia cache tensor shape:
+
+```text
+[batch, num_heads, seq_len, head_dim]
+```
+
+Budget modes:
+
+- `uniform`: every layer keeps the same ratio.
+- `pyramid`: lower layers keep more tokens and higher layers keep fewer.
+- `reversed`: lower layers keep fewer tokens and higher layers keep more.
+- `spindle`: middle layers keep more tokens and edge layers keep fewer.
+- `hourglass`: edge layers keep more tokens and middle layers keep fewer.
+- `dense`: disables compression for evaluation scripts.
+- `no_cache`: disables KV cache entirely and recomputes the full prefix every token.
+
+Selection methods:
+
+- `random`: reproducible random middle-token selection using `--seed`.
+- `key_norm`: selects middle tokens with the largest key-vector L2 norm.
+- `attention`: scores historical tokens by recent query attention. If attention
+  weights are unavailable, the code logs a warning and falls back to `key_norm`.
+
+## RoPE Correctness
+
+GPTNeoX/Pythia uses RoPE, so compressed cache length must not be treated as the
+true token position.  The manual generation loop keeps a `logical_seq_len`
+counter.  After prefill, the KV cache may be compressed from, for example, 1024
+tokens to 512 tokens, but the next generated token still receives
+`position_ids=1024` and `cache_position=1024`.
+
+This is why the scripts use `pyramidsinkkv.generate(...)` instead of relying on
+the default `model.generate(...)` cache-length inference.  The smoke test in
+`tests/test_pyramidsinkkv.py` also checks that compressed cache length and
+logical sequence length can differ.
+
+## Generation Benchmark
+
+Dense baseline:
+
 ```bash
-python benchmark_speed.py
+python -m scripts.benchmark_generation \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --budget_mode dense \
+  --score_method key_norm \
+  --max_new_tokens 256 \
+  --output_json results/dense_generation.json
 ```
+
+PyramidSinkKV:
+
+```bash
+python -m scripts.benchmark_generation \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --budget_mode pyramid \
+  --score_method key_norm \
+  --compression_ratio 0.5 \
+  --sink_size 4 \
+  --recent_size 64 \
+  --max_new_tokens 256 \
+  --output_json results/pyramid_generation.json
+```
+
+Without `--budget_mode` and `--score_method`, the script runs the default method
+suite: no-cache, dense, uniform key-norm, uniform random, pyramid key-norm,
+pyramid random, reversed key-norm, spindle, hourglass, no-sink, and no-recent.
+
+Reported metrics:
+
+- `TTFT`: time to first token, including prefill and optional cache compression.
+- `TPOT`: average time per output token after the first generated token.
+- `throughput`: generated tokens per second.
+- `total_time`: total generation time.
+- `kv_cache_memory_mb`: approximate final KV cache memory.
+- `achieved_compression_ratio`: actual compressed cache tokens divided by original cache tokens after prefill.
+
+Use longer generation lengths such as 256 or 512 tokens; Pythia-70M is small, so
+very short generations can hide speed differences.
+
+## Perplexity Evaluation
+
+WikiText:
+
+```bash
+python -m scripts.eval_ppl \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --dataset wikitext \
+  --split test \
+  --max_length 1024 \
+  --stride 128 \
+  --budget_mode pyramid \
+  --score_method key_norm \
+  --compression_ratio 0.5 \
+  --output_json results/pyramid_wikitext_ppl.json
+```
+
+PG-19 single-sample quick experiment:
+
+```bash
+python -m scripts.eval_ppl \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --dataset pg19 \
+  --split test \
+  --num_samples 1 \
+  --max_windows 2 \
+  --max_length 1024 \
+  --stride 128 \
+  --budget_mode pyramid \
+  --score_method key_norm \
+  --compression_ratio 0.5 \
+  --output_json results/pyramid_pg19_ppl.json
+```
+
+For dense PPL, use `--budget_mode dense`.
+
+## Ablation Table
+
+Run the full small ablation suite:
+
+```bash
+python -m scripts.run_ablation \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --compression_ratio 0.5 \
+  --max_new_tokens 256 \
+  --max_windows 2
+```
+
+Outputs:
+
+- `results/ablation_results.json`
+- `results/ablation_results.csv`
+- `results/ablation_table.md`
+
+The markdown table is intended to be copied directly into the final course
+report.  If an experiment fails, the runner records the error in the notes
+instead of inventing a result.
+
+### Current Local Run
+
+The table below was generated on this machine with the `pyramidsinkkv` conda
+environment, cached `EleutherAI/pythia-70m`, CPU, and float32.  PPL uses
+WikiText-2 raw test with `--max_length 512 --stride 64 --max_windows 1`.
+Generation uses 128 new tokens. Random baselines report PPL mean/std over seeds
+`0,1,2,3,4`; all generation timing columns report mean/std over 3 repeats.
+
+```bash
+TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 PYTHONPATH=. \
+/opt/miniconda3/envs/pyramidsinkkv/bin/python -m scripts.run_ablation \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --compression_ratio 0.5 \
+  --max_new_tokens 128 \
+  --dataset wikitext \
+  --split test \
+  --max_length 512 \
+  --stride 64 \
+  --max_windows 1 \
+  --device cpu \
+  --dtype float32 \
+  --results_dir results/readme_ablation_shapes \
+  --random_seeds 0,1,2,3,4 \
+  --generation_repeats 3
+```
+
+| Method | Budget mode | Score method | Sink size | Recent size | Compression ratio | PPL | TTFT (s) | TPOT (s/token) | Throughput (tok/s) | KV memory | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| no cache | no_cache | key_norm | 0 | 0 | 1.0 | 36.8719 | 0.0670 ± 0.0023 | 0.0701 ± 0.0005 | 14.27 ± 0.09 | 0.00 ± 0.00 MB | No KV cache; recomputes full prefix every token |
+| dense | dense | key_norm | 4 | 64 | 1.0 | 36.8791 | 0.0642 ± 0.0002 | 0.0045 ± 0.0000 | 201.70 ± 0.98 | 16.50 ± 0.00 MB | Dense baseline |
+| random uniform | uniform | random | 4 | 64 | 0.5 | 56.3064 ± 2.5614 | 0.0652 ± 0.0007 | 0.0042 ± 0.0001 | 215.83 ± 2.47 | 9.73 ± 0.00 MB | PPL seeds=0,1,2,3,4 |
+| key_norm uniform | uniform | key_norm | 4 | 64 | 0.5 | 74.3237 | 0.0683 ± 0.0013 | 0.0042 ± 0.0001 | 213.33 ± 6.55 | 9.73 ± 0.00 MB | Uniform SnapKV-style budget |
+| random pyramid | pyramid | random | 4 | 64 | 0.5 | 65.6226 ± 8.3482 | 0.0680 ± 0.0017 | 0.0043 ± 0.0001 | 210.29 ± 6.96 | 9.78 ± 0.00 MB | PPL seeds=0,1,2,3,4 |
+| key_norm pyramid | pyramid | key_norm | 4 | 64 | 0.5 | 72.7206 | 0.0689 ± 0.0015 | 0.0044 ± 0.0001 | 205.71 ± 6.46 | 9.78 ± 0.00 MB | Main PyramidSinkKV variant |
+| key_norm reversed | reversed | key_norm | 4 | 64 | 0.5 | 67.6268 | 0.0687 ± 0.0015 | 0.0042 ± 0.0000 | 211.62 ± 1.30 | 9.78 ± 0.00 MB | Reversed-pyramid ablation |
+| random spindle | spindle | random | 4 | 64 | 0.5 | 45.6265 ± 3.2682 | 0.0661 ± 0.0011 | 0.0042 ± 0.0000 | 214.17 ± 1.67 | 9.73 ± 0.00 MB | PPL seeds=0,1,2,3,4 |
+| key_norm spindle | spindle | key_norm | 4 | 64 | 0.5 | 54.9262 | 0.0671 ± 0.0002 | 0.0042 ± 0.0001 | 211.13 ± 5.36 | 9.73 ± 0.00 MB | Middle layers keep more |
+| random hourglass | hourglass | random | 4 | 64 | 0.5 | 77.3285 ± 5.4417 | 0.0674 ± 0.0013 | 0.0043 ± 0.0001 | 210.18 ± 5.26 | 9.74 ± 0.00 MB | PPL seeds=0,1,2,3,4 |
+| key_norm hourglass | hourglass | key_norm | 4 | 64 | 0.5 | 85.7068 | 0.0682 ± 0.0015 | 0.0043 ± 0.0001 | 210.45 ± 4.52 | 9.74 ± 0.00 MB | Edge layers keep more |
+| pyramid without sink | pyramid | key_norm | 0 | 64 | 0.5 | 107.0948 | 0.0676 ± 0.0010 | 0.0042 ± 0.0001 | 211.74 ± 2.48 | 9.76 ± 0.00 MB | No-sink ablation |
+| pyramid without recent | pyramid | key_norm | 4 | 0 | 0.5 | 78.4538 | 0.0677 ± 0.0023 | 0.0042 ± 0.0001 | 212.45 ± 4.06 | 9.74 ± 0.00 MB | No-recent-window ablation |
+
+## Terminal Speed Demo
+
+```bash
+python -m scripts.demo_speed_animation \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --methods dense,pyramid \
+  --max_new_tokens 256 \
+  --compression_ratio 0.5 \
+  --sink_size 4 \
+  --recent_size 64
+```
+
+If `rich` is installed, the demo shows a live panel.  Otherwise it falls back to
+plain stdout refresh.
+
+## Smoke Tests
+
+```bash
+python -m pytest tests
+```
+
+or, without pytest:
+
+```bash
+python tests/test_pyramidsinkkv.py
+python -m compileall pyramidsinkkv.py scripts tests
+```
+
+## Notes
+
+- This is a training-free method: no trainable parameters, no finetuning, and no
+  model weight updates.
+- The initial implementation compresses after prefill.  Repeated compression
+  during decoding is intentionally left out to keep the course-project baseline
+  reliable and easy to inspect.
+- Attention-score selection requires attention weights.  If the active attention
+  implementation does not return them, the code falls back to key-norm scoring
+  and logs a warning.
