@@ -1,9 +1,9 @@
-# PyramidSinkKV for Pythia-70M
+# Pythia-70M KV Cache Budgeting
 
-This repository implements a training-free KV cache compression method for
-`EleutherAI/pythia-70m` and `EleutherAI/pythia-70m-deduped`.  The backbone model
-weights are never updated.  All changes happen at inference time by compressing
-GPTNeoX/Pythia `past_key_values` after prefill.
+This repository studies training-free inference-time KV cache budgeting and
+compression for `EleutherAI/pythia-70m` and `EleutherAI/pythia-70m-deduped`.
+The backbone model weights are never updated.  All changes happen at inference
+time by changing how GPTNeoX/Pythia `past_key_values` are kept after prefill.
 
 The project includes:
 
@@ -11,7 +11,7 @@ The project includes:
 - no-cache baseline with `use_cache=False`
 - random KV baseline
 - uniform SnapKV-style budget
-- PyramidSinkKV with random, key-norm, or attention-score token selection
+- layer-budgeted KV compression with random, key-norm, or attention-score token selection
 - reversed-pyramid, spindle, hourglass, no-sink, and no-recent-window ablations
 - generation speed benchmark, PPL evaluation, ablation table generation, and a terminal streaming demo
 
