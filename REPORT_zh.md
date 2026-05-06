@@ -1,152 +1,127 @@
-# Pythia-70M KV Cache 预算分配与压缩实验报告
+# PyramidSinkKV + SnapKV 中文报告
 
-## 方法简介
+## 项目背景
 
-本项目研究 Pythia-70M 的训练免费 KV cache 预算分配与压缩。方法不更新模型权重，
-只在 prefill 后对每一层的 KV cache 做一次推理期压缩。对于每层缓存，方法会：
+本项目面向 `EleutherAI/pythia-70m` / GPTNeoX 结构，实现训练无关的 KV cache 压缩。模型权重不更新，推理时只改变 prefill 后 `past_key_values` 中保留哪些历史 token，从而研究上下文质量、KV 显存占用和生成速度之间的折中。
 
-1. 保留开头的 sink tokens；
-2. 保留最近的 recent window tokens；
-3. 在中间区域按指定分数选择 token；
-4. 将选中的索引排序，保持原始 token 顺序；
-5. 用这些索引 gather 每一层的 key/value 张量。
+## 为什么把 KV 压缩拆成两个问题
 
-支持的中间 token 选择方式包括 `random`、`key_norm`
+KV 压缩可以拆成两个相对独立的问题：
 
-本项目在此基础上加入逐层预算分配。`uniform` 模式让每一层使用相同保留
-比例；`pyramid` 模式给低层更多预算、高层更少预算；`reversed` 模式作为反向消融；
-`spindle` 模式让中间层保留更多、两端层保留更少；`hourglass` 模式让两端层保留更多、
-中间层保留更少。所有模式的平均 keep ratio 都近似等于 `--compression_ratio`，
-便于公平比较。
+1. 每层保留多少 token：由 `budget_mode` 控制。
+2. 每层保留哪些 token：由 `score_method` 控制。
+
+这样做的好处是可以公平比较不同 layer-wise budget 形状。`uniform`、`pyramid`、`reversed`、`spindle`、`hourglass` 在同一个 `compression_ratio` 下会尽量保持相近的平均保留比例，避免某个方法因为总 KV budget 更多而占便宜。
+
+## SnapKV 的作用
+
+新增的 `score_method=snapkv` 是 attention-based token selection。对于每一层：
+
+- 始终保留 sink tokens。
+- 始终保留 recent tokens。
+- 对中间区域 token，用 prefill 阶段返回的 attention weights 计算重要性。
+- 取最后 `observation_window` 个 query 位置到所有历史 key 位置的注意力：
+
+```text
+recent_attn = attentions[layer][:, :, -observation_window:, :]
+score = recent_attn.mean(dim=(0, 1, 2))
+```
+
+得到形状为 `[seq_len]` 的分数后，只在中间区域做 top-k，最后将 sink、SnapKV middle、recent 合并去重并按原始位置排序，以保证压缩后的 K/V 仍保持原始 token 顺序。
+
+## Layer-wise Budget 的作用
+
+- `uniform`：每层保留相同 token 比例。
+- `pyramid`：底层保留更多，高层保留更少。
+- `reversed`：底层保留更少，高层保留更多。
+- `spindle`：中间层保留更多，两端层保留更少。
+- `hourglass`：两端层保留更多，中间层保留更少。
+
+这些策略只决定“每层保留多少 token”。在本项目中，`snapkv` 决定“中间区域具体保留哪些 token”。
 
 ## 实现细节
 
-核心代码位于 `pyramidsinkkv.py`。GPTNeoX/Pythia 的 KV cache 预期形状为：
+核心实现位于 `pyramidsinkkv.py`：
 
-```text
-[batch, num_heads, seq_len, head_dim]
-```
+- `PyramidSinkKVConfig` 增加 `observation_window`、`debug_selection` 等配置。
+- `_snapkv_attention_scores` 显式处理 `[batch, heads, query_len, key_len]` attention tensor，并返回 `[seq_len]` 分数。
+- `select_token_indices` 保证 selected indices 为一维、递增、唯一、合法。
+- `gather_kv_by_indices` 只沿 seq 维度 gather K/V。
+- `compress_past_key_values` 记录 `achieved_compression_ratio`、`per_layer_keep_lengths`、fallback 状态等诊断信息。
 
-每层预算由 `--budget_mode {uniform,pyramid,reversed,spindle,hourglass}` 和
-`--compression_ratio` 决定。token 保留策略由以下参数控制：
-
-- `--sink_size`
-- `--recent_size`
-- `--score_method {attention,key_norm,random}`
-
-当前实现只在 prefill 后压缩一次。这样做牺牲了一部分极限压缩潜力，但逻辑更透明，
-也更适合课程项目复现。
+SnapKV 需要 attention weights。加载模型时会优先尝试 `attn_implementation="eager"`；如果当前 Transformers/GPTNeoX 组合不支持，会重试普通加载。如果 prefill 后仍然拿不到 attention weights，会明确记录 `score_method_fallback=true`，并回退到 `key_norm`，不会静默改变实验设置。
 
 ## RoPE / position_ids 注意事项
 
-GPTNeoX/Pythia 使用 RoPE。KV cache 被压缩后，缓存长度不再等于真实序列长度。如果
-直接让 HuggingFace 根据 `past_key_values.get_seq_length()` 推断下一个位置，RoPE
-位置会被错误地“重置”到压缩后的长度。
+GPTNeoX/Pythia 使用 RoPE。KV cache 被压缩后，物理 cache 长度会小于真实上下文长度，但下一个 token 的 `position_ids` 必须继续使用真实绝对位置。
 
-因此，本项目的生成循环维护 `logical_seq_len`。例如 prefill 长度是 1024，压缩后
-cache 长度可能是 512，但下一个生成 token 仍然必须使用：
+例如 prefill 长度为 1024，压缩后 KV 长度为 512，下一个生成 token 仍然必须使用：
 
 ```text
 position_ids = 1024
 cache_position = 1024
 ```
 
-代码中有注释说明这一点，`tests/test_pyramidsinkkv.py` 也包含一个小型 sanity check，
-验证压缩后的 cache 长度可以不同于逻辑序列长度。
+因此代码维护 `logical_seq_len`。解码时 attention mask 对应压缩后的物理 KV 长度加当前 token，而 RoPE 位置仍然来自真实逻辑位置。`compressed_cache_len != logical_seq_len` 是预期情况。
 
 ## 实验设置
 
-推荐模型：
-
-- `EleutherAI/pythia-70m`
-- `EleutherAI/pythia-70m-deduped`
-
-如果需要使用 HuggingFace 镜像：
+推荐命令：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
-```
-
-生成实验建议使用较长输出，例如 `--max_new_tokens 256` 或 `512`。Pythia-70M 较小，
-输出太短时 TTFT 和 TPOT 的差异容易被计时噪声掩盖。
-
-## Ablation 表格
-
-运行：
-
-```bash
-TRANSFORMERS_OFFLINE=1 HF_HUB_OFFLINE=1 PYTHONPATH=. \
-/opt/miniconda3/envs/pyramidsinkkv/bin/python -m scripts.run_ablation \
+python -m scripts.run_ablation \
   --model_name_or_path EleutherAI/pythia-70m \
   --compression_ratio 0.5 \
-  --max_new_tokens 128 \
+  --max_new_tokens 256 \
   --dataset wikitext \
   --split test \
-  --max_length 512 \
-  --stride 64 \
-  --max_windows 1 \
-  --device cpu \
-  --dtype float32 \
-  --results_dir results/readme_ablation_shapes \
-  --random_seeds 0,1,2,3,4 \
-  --generation_repeats 3
+  --max_length 1024 \
+  --stride 128 \
+  --max_windows 2 \
+  --score_methods random,snapkv \
+  --budget_modes uniform,pyramid,reversed,spindle,hourglass
 ```
 
-本次实验在本机 `pyramidsinkkv` conda 环境中运行，模型使用本地缓存的
-`EleutherAI/pythia-70m`，设备为 CPU，数值类型为 float32。PPL 为 WikiText-2 raw
-test 的小样本 continuation PPL，只使用 1 个 window。random baseline 的 PPL
-报告 seeds `0,1,2,3,4` 的均值和标准差；所有生成速度指标报告 3 次重复计时的均值
-和标准差。因此下表比单次实验更稳定，但仍不应解读为完整 WikiText 测评。
+输出文件包括：
 
-| Method | Budget mode | Score method | Sink size | Recent size | Compression ratio | PPL | TTFT | TPOT | Throughput | KV memory | Notes |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| no cache | no_cache | key_norm | 0 | 0 | 1.0 | 36.8719 | 0.0670 ± 0.0023 | 0.0701 ± 0.0005 | 14.27 ± 0.09 | 0.00 ± 0.00 MB | No KV cache; recomputes full prefix every token |
-| dense | dense | key_norm | 4 | 64 | 1.0 | 36.8791 | 0.0642 ± 0.0002 | 0.0045 ± 0.0000 | 201.70 ± 0.98 | 16.50 ± 0.00 MB | Dense baseline |
-| random uniform | uniform | random | 4 | 64 | 0.5 | 56.3064 ± 2.5614 | 0.0652 ± 0.0007 | 0.0042 ± 0.0001 | 215.83 ± 2.47 | 9.73 ± 0.00 MB | PPL seeds=0,1,2,3,4 |
-| key_norm uniform | uniform | key_norm | 4 | 64 | 0.5 | 74.3237 | 0.0683 ± 0.0013 | 0.0042 ± 0.0001 | 213.33 ± 6.55 | 9.73 ± 0.00 MB | Uniform SnapKV-style budget |
-| random pyramid | pyramid | random | 4 | 64 | 0.5 | 65.6226 ± 8.3482 | 0.0680 ± 0.0017 | 0.0043 ± 0.0001 | 210.29 ± 6.96 | 9.78 ± 0.00 MB | PPL seeds=0,1,2,3,4 |
-| key_norm pyramid | pyramid | key_norm | 4 | 64 | 0.5 | 72.7206 | 0.0689 ± 0.0015 | 0.0044 ± 0.0001 | 205.71 ± 6.46 | 9.78 ± 0.00 MB | Main PyramidSinkKV variant |
-| key_norm reversed | reversed | key_norm | 4 | 64 | 0.5 | 67.6268 | 0.0687 ± 0.0015 | 0.0042 ± 0.0000 | 211.62 ± 1.30 | 9.78 ± 0.00 MB | Reversed-pyramid ablation |
-| random spindle | spindle | random | 4 | 64 | 0.5 | 45.6265 ± 3.2682 | 0.0661 ± 0.0011 | 0.0042 ± 0.0000 | 214.17 ± 1.67 | 9.73 ± 0.00 MB | PPL seeds=0,1,2,3,4 |
-| key_norm spindle | spindle | key_norm | 4 | 64 | 0.5 | 54.9262 | 0.0671 ± 0.0002 | 0.0042 ± 0.0001 | 211.13 ± 5.36 | 9.73 ± 0.00 MB | Middle layers keep more |
-| random hourglass | hourglass | random | 4 | 64 | 0.5 | 77.3285 ± 5.4417 | 0.0674 ± 0.0013 | 0.0043 ± 0.0001 | 210.18 ± 5.26 | 9.74 ± 0.00 MB | PPL seeds=0,1,2,3,4 |
-| key_norm hourglass | hourglass | key_norm | 4 | 64 | 0.5 | 85.7068 | 0.0682 ± 0.0015 | 0.0043 ± 0.0001 | 210.45 ± 4.52 | 9.74 ± 0.00 MB | Edge layers keep more |
-| pyramid without sink | pyramid | key_norm | 0 | 64 | 0.5 | 107.0948 | 0.0676 ± 0.0010 | 0.0042 ± 0.0001 | 211.74 ± 2.48 | 9.76 ± 0.00 MB | No-sink ablation |
-| pyramid without recent | pyramid | key_norm | 4 | 0 | 0.5 | 78.4538 | 0.0677 ± 0.0023 | 0.0042 ± 0.0001 | 212.45 ± 4.06 | 9.74 ± 0.00 MB | No-recent-window ablation |
+- `results/group_main_ablation.{json,csv,md}`
+- `results/group_ratio_sweep.{json,csv,md}`
+- `results/group_sink_recent_ablation.{json,csv,md}`
+
+表格指标包括 `ppl`、`ttft`、`tpot`、`throughput`、`total_time`、`kv_cache_memory_mb`、`achieved_compression_ratio`、`scoring_overhead_sec`、`snapkv_fallback_status` 和 `notes`。如果 `score_method=snapkv` 回退到 `key_norm`，该行必须标记为 `fallback_to_key_norm`，并且不能解释为真正的 SnapKV 结果。
+
+## 主实验表格
+
+见 `GROUP_REPORT_TABLES_zh.md`。如果尚未运行真实实验，表格保留 TODO，不填入虚构数字。
+
+## Compression Ratio Sweep 表格
+
+见 `GROUP_REPORT_TABLES_zh.md`。计划比较 `compression_ratio` 为 0.75、0.5、0.25 时，`uniform/spindle + random` 和 `uniform/spindle + snapkv` 的表现，并只保留一次 dense baseline。
+
+## Sink/Recent 消融表格
+
+见 `GROUP_REPORT_TABLES_zh.md`。默认使用 `spindle + snapkv`，比较保留 sink+recent、去掉 sink、去掉 recent、两者都去掉。
 
 ## 结果分析
 
-从这次小样本实验看，no-cache baseline 不保存 KV cache，因此 KV memory 为 0，
-但 TPOT 达到 0.0701 s/token，吞吐只有 14.27 tok/s；相比之下 dense KV cache 的
-TPOT 为 0.0045 s/token，吞吐为 201.70 tok/s。这说明 KV cache 本身是现代自回归
-推理的关键优化，不应该把 dense baseline 理解为“不用 KV”。
+本次 CPU/float32 小样本实验中，dense PPL 为 21.1162，no-cache PPL 基本相同，但 TPOT 从 dense 的 0.0049 s/token 上升到 0.0854 s/token，说明 KV cache 对自回归解码速度仍然非常关键。
 
-所有压缩方法都把 KV memory 从 dense 的 16.50 MB 降到约 9.7 MB，TPOT 维持在约
-0.0041-0.0044 s/token，说明压缩后的 cache 确实减少了解码阶段的计算和访存开销，
-同时保持了接近 dense KV cache 的速度优势。
+在 `compression_ratio=0.5` 的主实验中，spindle 系列明显优于 uniform 和 pyramid。`spindle + random` 的 PPL 为 26.3768 +/- 2.1393，`spindle + snapkv` 的 PPL 为 26.4305，二者非常接近，并且都显著优于 `uniform + random` 的 33.8358 和 `uniform + snapkv` 的 40.3360。`hourglass + snapkv` 的 PPL 为 58.8478，是主实验中较差的压缩策略，说明把预算偏向两端层不适合这个设置。
 
-质量方面，dense PPL 为 36.88；纺锤形 random 在本次小样本中表现最好，5-seed
-平均 PPL 为 45.63，明显优于 uniform random 的 56.31 和 pyramid random 的 65.62。
-这提示 Pythia-70M 在该样本上可能更依赖中间层的历史 KV 保留。相反，沙漏型
-hourglass 的 PPL 较高，random hourglass 为 77.33，key_norm hourglass 为 85.71，
-说明简单地把预算偏向两端层并不适合这个设置。
+ratio sweep 中，压缩越强 PPL 越高：例如 `uniform + snapkv` 从 ratio 0.75 的 29.5593 上升到 ratio 0.25 的 58.2325；`spindle + snapkv` 从 23.8238 上升到 47.7264。spindle 在三个 ratio 下都比 uniform 更稳。random baseline 在这个短窗口 WikiText 设置下仍然很强，尤其 `spindle + random` 在 ratio 0.75/0.5/0.25 下分别为 22.5578、26.3768、41.0463，均不差于对应 SnapKV。
 
-随机选择在这个小样本上仍然普遍优于 key_norm；例如 spindle random 为 45.63，
-spindle key_norm 为 54.93。这个现象不应过度解读，因为本次 PPL 只评估了一个窗口，
-但它提示 key_norm 作为简单启发式并不一定稳定优于随机基线。no-sink ablation 的 PPL
-上升到 107.09，是本次实验中最差的结果，说明 attention sink 对维持上下文质量
-很重要。no-recent-window 的 PPL 为 78.45，也明显差于 random 压缩方法，说明
-近期窗口同样有贡献。
+sink/recent 消融在本次 `spindle + snapkv` 设置下差异很小：默认 sink+recent 的 PPL 为 26.4305，去掉 sink 为 26.2927，去掉 recent 为 26.2726，两者都去掉为 26.2553。这个现象只说明当前两窗口小样本不敏感，不能推广到长上下文或更大模型。
 
-## 性能瓶颈讨论
+所有 SnapKV 行的 `snapkv_fallback_status` 均为 `true_snapkv`，没有发生 key_norm fallback。需要注意的是，SnapKV prefill 为了获取 attention weights 使用 eager attention；压缩后 decode 切回 SDPA，以支持不同层有不同压缩后 KV 长度的 layer-wise budget。
 
-当前实现优先保证正确性和可读性。压缩阶段使用 PyTorch gather，生成阶段使用 Python
-循环，因此不是极限优化版本。对于 Pythia-70M，模型很小，Python 调度和 CPU/GPU
-同步开销可能占比较高。更大的模型或更长的生成长度更容易体现 KV cache 缩短后的
-TPOT 收益。
+## 局限性
+
+- 获取 attention weights 会带来 TTFT overhead；当前实现是研究型、易复现版本，不是 kernel-fused 优化版本。
+- Pythia-70M 模型太小，速度收益可能不明显。
+- CPU timing 不代表 GPU kernel-level speedup。
+- random baseline 可能在短上下文 WikiText 上较强，单次小样本实验不能过度解读。
 
 ## 结论
 
-这次试验对于各种各样的token保留结构进行了讨论，最终的初步结论是，纺锤形的保留结构是
-比较合理的，同时也可以看出来，单纯从norm来判断一个token是不适合保留实际上效果还不如random
-接下来的实验希望能考虑更多的token保留方式。
+本项目现在把 layer-wise budget 和 token selection 清晰解耦：`budget_mode` 控制每层保留多少 token，`score_method=snapkv` 使用 attention-based 分数决定中间区域保留哪些 token。主实验聚焦 dense/no-cache、random 和 SnapKV；`key_norm` 只作为 SnapKV attention weights 不可用时的内部 fallback，并在表格中通过 `snapkv_fallback_status` 明确标出。

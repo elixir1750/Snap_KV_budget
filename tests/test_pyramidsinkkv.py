@@ -5,7 +5,15 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pyramidsinkkv import PyramidSinkKVConfig, cache_seq_length, compress_past_key_values, layer_keep_ratios
+from pyramidsinkkv import (
+    PyramidSinkKVConfig,
+    _snapkv_attention_scores,
+    cache_seq_length,
+    compress_past_key_values,
+    gather_kv_by_indices,
+    layer_keep_ratios,
+    select_token_indices,
+)
 
 
 def test_layer_ratios_keep_average_close():
@@ -54,6 +62,75 @@ def test_compress_cache_preserves_shape_and_logical_length_can_differ():
     assert compressed_cache_len < logical_seq_len
 
 
+def test_selected_indices_sorted_unique_and_preserve_sink_recent():
+    key = torch.randn(1, 2, 16, 4)
+    attention = torch.zeros(1, 2, 16, 16)
+    attention[:, :, -4:, 7] = 10.0
+    config = PyramidSinkKVConfig(
+        compression_ratio=0.5,
+        sink_size=2,
+        recent_size=3,
+        budget_mode="uniform",
+        score_method="snapkv",
+        observation_window=4,
+    )
+
+    indices, used_method, fallback = select_token_indices(key, 8, config, layer_idx=0, attention=attention)
+
+    assert used_method == "snapkv"
+    assert fallback is False
+    assert indices.tolist() == sorted(set(indices.tolist()))
+    assert {0, 1}.issubset(set(indices.tolist()))
+    assert {13, 14, 15}.issubset(set(indices.tolist()))
+    assert 7 in set(indices.tolist())
+
+
+def test_gather_kv_length_matches_selected_indices():
+    key = torch.randn(1, 2, 10, 4)
+    value = torch.randn(1, 2, 10, 4)
+    selected = torch.tensor([0, 2, 5, 9], dtype=torch.long)
+
+    compressed_key, compressed_value = gather_kv_by_indices(key, value, selected)
+
+    assert compressed_key.shape == (1, 2, 4, 4)
+    assert compressed_value.shape == (1, 2, 4, 4)
+    assert torch.equal(compressed_key[:, :, 1, :], key[:, :, 2, :])
+
+
+def test_snapkv_score_shape_is_seq_len():
+    attention = torch.rand(2, 3, 6, 12)
+    scores = _snapkv_attention_scores(attention, seq_len=12, observation_window=4)
+
+    assert scores is not None
+    assert scores.shape == (12,)
+
+
+def test_snapkv_fallback_to_key_norm_is_recorded_when_attentions_unavailable():
+    layers = []
+    for _ in range(2):
+        key = torch.randn(1, 2, 16, 4)
+        value = torch.randn(1, 2, 16, 4)
+        layers.append((key, value))
+    config = PyramidSinkKVConfig(
+        compression_ratio=0.5,
+        sink_size=2,
+        recent_size=3,
+        budget_mode="uniform",
+        score_method="snapkv",
+        observation_window=4,
+    )
+
+    _, stats = compress_past_key_values(tuple(layers), config, attentions=None)
+
+    assert stats["score_method_fallback"] is True
+    assert stats["fallback_score_method"] == "key_norm"
+    assert all(item["fallback_to_key_norm"] for item in stats["per_layer"])
+
+
 if __name__ == "__main__":
     test_layer_ratios_keep_average_close()
     test_compress_cache_preserves_shape_and_logical_length_can_differ()
+    test_selected_indices_sorted_unique_and_preserve_sink_recent()
+    test_gather_kv_length_matches_selected_indices()
+    test_snapkv_score_shape_is_seq_len()
+    test_snapkv_fallback_to_key_norm_is_recorded_when_attentions_unavailable()

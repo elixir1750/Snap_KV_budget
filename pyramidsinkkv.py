@@ -9,9 +9,12 @@ not to the shortened cache length.
 from __future__ import annotations
 
 import logging
+import json
 import math
+import os
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -39,8 +42,11 @@ class PyramidSinkKVConfig:
     recent_size: int = 64
     budget_mode: str = "pyramid"
     score_method: str = "key_norm"
+    observation_window: int = 32
     seed: int = 0
     safe_min_length: int = 8
+    debug_selection: bool = False
+    debug_dir: str = "results/debug_selection"
 
     def enabled(self) -> bool:
         return self.budget_mode not in ("dense", "no_cache") and self.compression_ratio < 0.999
@@ -176,12 +182,41 @@ def cache_seq_length(cache: Any, layer_idx: int = 0) -> int:
     return int(legacy[layer_idx][0].shape[-2])
 
 
+def cache_seq_lengths(cache: Any) -> List[int]:
+    return [int(key.shape[-2]) for key, _ in _cache_to_legacy(cache)]
+
+
+def get_seq_len_from_kv(key: torch.Tensor) -> int:
+    """Return the KV sequence length for GPTNeoX/Pythia cache tensors."""
+
+    if key.ndim != 4:
+        raise ValueError(f"Expected key tensor [batch, heads, seq, dim], got shape {tuple(key.shape)}")
+    return int(key.shape[-2])
+
+
 def approximate_kv_cache_bytes(cache: Any) -> int:
     total = 0
     for key, value in _cache_to_legacy(cache):
         total += key.numel() * key.element_size()
         total += value.numel() * value.element_size()
     return int(total)
+
+
+def decode_attention_mask_for_cache(cache: Any, device: torch.device) -> Optional[torch.Tensor]:
+    """Return a decode mask only when one global mask fits every layer.
+
+    Layer-wise budgets can produce different physical cache lengths per layer.
+    HuggingFace GPTNeoX accepts only one attention_mask, so a global mask is
+    valid only when all layers have the same compressed length.  With batch size
+    one and no padding, omitting the mask lets each layer attend over its own
+    physical K/V length while explicit position_ids/cache_position preserve
+    RoPE's logical absolute positions.
+    """
+
+    lengths = cache_seq_lengths(cache)
+    if not lengths or len(set(lengths)) != 1:
+        return None
+    return torch.ones((1, lengths[0] + 1), dtype=torch.long, device=device)
 
 
 def _mandatory_indices(seq_len: int, sink_size: int, recent_size: int, device: torch.device) -> torch.Tensor:
@@ -209,12 +244,160 @@ def _key_norm_scores(key: torch.Tensor) -> torch.Tensor:
 
 
 def _attention_scores(attention: Optional[torch.Tensor], seq_len: int, recent_size: int) -> Optional[torch.Tensor]:
+    return _snapkv_attention_scores(attention, seq_len, recent_size)
+
+
+def _snapkv_attention_scores(
+    attention: Optional[torch.Tensor],
+    seq_len: int,
+    observation_window: int,
+) -> Optional[torch.Tensor]:
+    """Compute SnapKV-style scores from recent queries to all prompt keys.
+
+    HF GPTNeoX attentions are normally ``[batch, heads, query_len, key_len]``.
+    We explicitly validate this shape and average the last observation-window
+    query rows over batch, heads, and query positions, yielding ``[seq_len]``.
+    """
+
     if attention is None or not torch.is_tensor(attention):
         return None
-    if attention.ndim != 4 or attention.shape[-1] != seq_len:
+    if attention.ndim != 4:
         return None
-    window = min(max(recent_size, 1), attention.shape[-2])
-    return attention[:, :, -window:, :].float().mean(dim=(0, 1, 2))
+    if int(attention.shape[-1]) < seq_len:
+        return None
+    window = min(max(int(observation_window), 1), int(attention.shape[-2]))
+    key_start = int(attention.shape[-1]) - seq_len
+    recent_attn = attention[:, :, -window:, key_start:]
+    score = recent_attn.float().mean(dim=(0, 1, 2))
+    if score.ndim != 1 or int(score.shape[0]) != seq_len:
+        return None
+    return score
+
+
+def _select_middle_by_method(
+    key: torch.Tensor,
+    candidates: torch.Tensor,
+    remaining: int,
+    method: str,
+    config: PyramidSinkKVConfig,
+    layer_idx: int,
+    attention: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, str, bool]:
+    """Select middle-token indices and report the method actually used."""
+
+    seq_len = get_seq_len_from_kv(key)
+    fallback = False
+    if method == "random":
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(config.seed) + int(layer_idx))
+        perm = torch.randperm(int(candidates.numel()), generator=generator)[:remaining].to(key.device)
+        return candidates[perm], method, fallback
+
+    scores: Optional[torch.Tensor] = None
+    if method == "attention":
+        scores = _attention_scores(attention, seq_len, config.recent_size)
+        if scores is None:
+            LOGGER.warning(
+                "Attention weights are unavailable for layer %s; falling back to key_norm scoring.",
+                layer_idx,
+            )
+            method = "key_norm"
+            fallback = True
+    elif method == "snapkv":
+        scores = _snapkv_attention_scores(attention, seq_len, config.observation_window)
+        if scores is None:
+            LOGGER.warning(
+                "SnapKV attention weights are unavailable; falling back to key_norm. layer=%s",
+                layer_idx,
+            )
+            method = "key_norm"
+            fallback = True
+
+    if method == "key_norm":
+        scores = _key_norm_scores(key)
+    if scores is None:
+        raise ValueError(f"Unsupported score_method: {method}")
+    middle_scores = scores[candidates]
+    top = torch.topk(middle_scores, k=remaining, largest=True).indices
+    return candidates[top], method, fallback
+
+
+def gather_kv_by_indices(key: torch.Tensor, value: torch.Tensor, selected_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Gather K/V along the sequence dimension only."""
+
+    seq_len = get_seq_len_from_kv(key)
+    assert_valid_selected_indices(selected_indices, seq_len)
+    if value.ndim != 4 or int(value.shape[-2]) != seq_len:
+        raise ValueError(f"Expected value tensor [batch, heads, seq, dim], got shape {tuple(value.shape)}")
+    gather_idx = selected_indices.view(1, 1, -1, 1).expand(key.shape[0], key.shape[1], -1, key.shape[-1])
+    compressed_key = torch.gather(key, dim=2, index=gather_idx)
+    value_idx = selected_indices.view(1, 1, -1, 1).expand(value.shape[0], value.shape[1], -1, value.shape[-1])
+    compressed_value = torch.gather(value, dim=2, index=value_idx)
+    expected = int(selected_indices.numel())
+    if int(compressed_key.shape[-2]) != expected or int(compressed_value.shape[-2]) != expected:
+        raise AssertionError("compressed K/V length does not match selected indices length")
+    return compressed_key.contiguous(), compressed_value.contiguous()
+
+
+def _selection_summary(indices: torch.Tensor, seq_len: int) -> Dict[str, Any]:
+    cpu = indices.detach().cpu()
+    gaps = (cpu[1:] - cpu[:-1]) if cpu.numel() > 1 else torch.empty(0, dtype=cpu.dtype)
+    return {
+        "selected_indices": [int(x) for x in cpu.tolist()],
+        "num_selected": int(cpu.numel()),
+        "min_selected_index": int(cpu.min().item()) if cpu.numel() else None,
+        "max_selected_index": int(cpu.max().item()) if cpu.numel() else None,
+        "average_selected_index": float(cpu.float().mean().item()) if cpu.numel() else None,
+        "max_gap": int(gaps.max().item()) if gaps.numel() else 0,
+        "average_gap": float(gaps.float().mean().item()) if gaps.numel() else 0.0,
+        "seq_len": int(seq_len),
+    }
+
+
+def _overlap_ratio(left: torch.Tensor, right: torch.Tensor) -> float:
+    if left.numel() == 0:
+        return 0.0
+    left_set = set(int(x) for x in left.detach().cpu().tolist())
+    right_set = set(int(x) for x in right.detach().cpu().tolist())
+    return len(left_set & right_set) / max(len(left_set), 1)
+
+
+def _save_selection_debug(
+    key: torch.Tensor,
+    selected: torch.Tensor,
+    keep_count: int,
+    config: PyramidSinkKVConfig,
+    layer_idx: int,
+    attention: Optional[torch.Tensor],
+    used_method: str,
+) -> None:
+    if not config.debug_selection:
+        return
+    seq_len = get_seq_len_from_kv(key)
+    mandatory = _mandatory_indices(seq_len, config.sink_size, config.recent_size, key.device)
+    candidates = _middle_candidates(seq_len, config.sink_size, config.recent_size, key.device)
+    remaining = max(0, min(int(keep_count), seq_len) - int(mandatory.numel()))
+    payload = _selection_summary(selected, seq_len)
+    payload.update({"layer": int(layer_idx), "score_method": config.score_method, "used_score_method": used_method})
+    if remaining > 0 and candidates.numel() > 0:
+        baseline_config = PyramidSinkKVConfig(**{**asdict(config), "debug_selection": False})
+        if used_method != "random":
+            random_middle, _, _ = _select_middle_by_method(
+                key, candidates, min(remaining, int(candidates.numel())), "random", baseline_config, layer_idx, attention
+            )
+            random_selected = torch.unique(torch.cat([mandatory, random_middle]), sorted=True)
+            payload["overlap_with_random"] = _overlap_ratio(selected, random_selected)
+        if used_method != "key_norm":
+            key_norm_middle, _, _ = _select_middle_by_method(
+                key, candidates, min(remaining, int(candidates.numel())), "key_norm", baseline_config, layer_idx, attention
+            )
+            key_norm_selected = torch.unique(torch.cat([mandatory, key_norm_middle]), sorted=True)
+            payload["overlap_with_key_norm"] = _overlap_ratio(selected, key_norm_selected)
+    debug_dir = Path(config.debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = int(time.time() * 1000)
+    out = debug_dir / f"{config.budget_mode}_{config.score_method}_layer{layer_idx:02d}_{os.getpid()}_{timestamp}.json"
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def select_token_indices(
@@ -223,12 +406,13 @@ def select_token_indices(
     config: PyramidSinkKVConfig,
     layer_idx: int,
     attention: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, str]:
+) -> Tuple[torch.Tensor, str, bool]:
     """Select ordered token indices for one layer.
 
     Sink and recent regions are always retained first.  Middle tokens are then
-    selected by random, key-norm, or attention score.  The returned indices are
-    sorted so the compressed cache preserves original token order.
+    selected by random, key-norm, legacy attention, or SnapKV attention scores.
+    The returned indices are sorted so the compressed cache preserves original
+    token order.
     """
 
     seq_len = int(key.shape[-2])
@@ -243,38 +427,22 @@ def select_token_indices(
         selected = mandatory
         selected = torch.unique(selected, sorted=True)
         assert_valid_selected_indices(selected, seq_len)
-        return selected, config.score_method
+        _save_selection_debug(key, selected, keep_count, config, layer_idx, attention, config.score_method)
+        return selected, config.score_method, False
     if remaining >= candidates.numel():
         selected = torch.cat([mandatory, candidates])
         selected = torch.unique(selected, sorted=True)
         assert_valid_selected_indices(selected, seq_len)
-        return selected, config.score_method
+        _save_selection_debug(key, selected, keep_count, config, layer_idx, attention, config.score_method)
+        return selected, config.score_method, False
 
-    method = config.score_method
-    if method == "random":
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(int(config.seed) + int(layer_idx))
-        perm = torch.randperm(int(candidates.numel()), generator=generator)[:remaining].to(device)
-        middle = candidates[perm]
-    else:
-        if method == "attention":
-            scores = _attention_scores(attention, seq_len, config.recent_size)
-            if scores is None:
-                LOGGER.warning(
-                    "Attention weights are unavailable for layer %s; falling back to key_norm scoring.",
-                    layer_idx,
-                )
-                method = "key_norm"
-        if method == "key_norm":
-            scores = _key_norm_scores(key)
-        middle_scores = scores[candidates]
-        top = torch.topk(middle_scores, k=remaining, largest=True).indices
-        middle = candidates[top]
+    middle, method, fallback = _select_middle_by_method(key, candidates, remaining, config.score_method, config, layer_idx, attention)
 
     selected = torch.cat([mandatory, middle])
     selected = torch.unique(selected, sorted=True)
     assert_valid_selected_indices(selected, seq_len)
-    return selected, method
+    _save_selection_debug(key, selected, keep_count, config, layer_idx, attention, method)
+    return selected, method, fallback
 
 
 def assert_valid_selected_indices(indices: torch.Tensor, seq_len: int) -> None:
@@ -304,6 +472,7 @@ def compress_past_key_values(
     ratios = layer_keep_ratios(num_layers, config.compression_ratio, config.budget_mode)
     compressed_layers: List[Tuple[torch.Tensor, torch.Tensor]] = []
     per_layer = []
+    fallback_layers = []
 
     for layer_idx, ((key, value), ratio) in enumerate(zip(legacy, ratios)):
         if key.ndim != 4 or value.ndim != 4:
@@ -317,12 +486,12 @@ def compress_past_key_values(
         target_keep = max(target_keep, safe_min)
         target_keep = min(seq_len, target_keep)
         attention = attentions[layer_idx] if attentions is not None and layer_idx < len(attentions) else None
-        indices, used_method = select_token_indices(key, target_keep, config, layer_idx, attention)
+        indices, used_method, fallback = select_token_indices(key, target_keep, config, layer_idx, attention)
 
-        gather_idx = indices.view(1, 1, -1, 1).expand(key.shape[0], key.shape[1], -1, key.shape[-1])
-        compressed_key = torch.gather(key, dim=2, index=gather_idx)
-        compressed_value = torch.gather(value, dim=2, index=gather_idx)
-        compressed_layers.append((compressed_key.contiguous(), compressed_value.contiguous()))
+        compressed_key, compressed_value = gather_kv_by_indices(key, value, indices)
+        compressed_layers.append((compressed_key, compressed_value))
+        if fallback:
+            fallback_layers.append(layer_idx)
         per_layer.append(
             {
                 "layer": layer_idx,
@@ -331,6 +500,8 @@ def compress_past_key_values(
                 "target_keep_ratio": float(ratio),
                 "actual_keep_ratio": float(indices.numel() / max(seq_len, 1)),
                 "score_method": used_method,
+                "requested_score_method": config.score_method,
+                "fallback_to_key_norm": bool(fallback),
             }
         )
 
@@ -343,6 +514,11 @@ def compress_past_key_values(
         "original_tokens": original_tokens,
         "compressed_tokens": compressed_tokens,
         "achieved_compression_ratio": compressed_tokens / max(original_tokens, 1),
+        "per_layer_keep_lengths": [item["compressed_seq_len"] for item in per_layer],
+        "score_method": config.score_method,
+        "score_method_fallback": bool(fallback_layers),
+        "fallback_score_method": "key_norm" if fallback_layers else None,
+        "fallback_layers": fallback_layers,
     }
     return compressed_cache, stats
 
@@ -370,16 +546,22 @@ def generate(
 
     encoded = tokenizer(prompt, return_tensors="pt")
     input_ids = encoded.input_ids.to(device)
+    prefill_attention_mask = getattr(encoded, "attention_mask", torch.ones_like(input_ids)).to(device)
     logical_seq_len = int(input_ids.shape[1])
-    output_attentions = (not dense) and config.score_method == "attention"
+    output_attentions = (not dense) and config.score_method in ("attention", "snapkv")
+    original_attn_impl = getattr(model.config, "_attn_implementation", None)
+    if output_attentions and original_attn_impl is not None:
+        model.config._attn_implementation = "eager"
 
     synchronize_if_cuda(device)
     start = time.perf_counter()
     with torch.no_grad():
         prefill_outputs = model(
             input_ids=input_ids,
+            attention_mask=prefill_attention_mask,
             use_cache=True,
             output_attentions=output_attentions,
+            return_dict=True,
         )
         past_key_values = prefill_outputs.past_key_values
         compression_stats: Dict[str, Any] = {
@@ -387,13 +569,33 @@ def generate(
             "original_tokens": logical_seq_len * len(_cache_to_legacy(past_key_values)),
             "compressed_tokens": logical_seq_len * len(_cache_to_legacy(past_key_values)),
             "per_layer": [],
+            "per_layer_keep_lengths": [],
+            "score_method_fallback": False,
+            "fallback_score_method": None,
+            "scoring_overhead_sec": 0.0,
+            "compression_overhead_sec": 0.0,
         }
         if not dense:
+            compression_start = time.perf_counter()
             past_key_values, compression_stats = compress_past_key_values(
                 past_key_values,
                 config,
-                prefill_outputs.attentions,
+                getattr(prefill_outputs, "attentions", None),
             )
+            compression_stats["compression_overhead_sec"] = time.perf_counter() - compression_start
+            compression_stats["scoring_overhead_sec"] = 0.0
+            if output_attentions:
+                compression_stats["scoring_note"] = (
+                    "SnapKV/attention scoring used attention weights returned by the prefill pass; "
+                    "its overhead is included in TTFT rather than measured as a separate extra pass."
+                )
+                if getattr(model.config, "_attn_implementation", None) == "eager":
+                    # Eager attention is needed for attention weights during
+                    # prefill, but GPTNeoX eager decode assumes one global mask
+                    # length and cannot handle layer-wise compressed KV lengths.
+                    # Decode with the default SDPA path after scoring.
+                    model.config._attn_implementation = "sdpa"
+                    compression_stats["decode_attention_implementation"] = "sdpa"
             compressed_len = cache_seq_length(past_key_values)
             # RoPE sanity check: after compression, the cache length is allowed
             # to be shorter than the true logical sequence.  Decoding below
@@ -419,16 +621,25 @@ def generate(
         # position.  Always pass the true logical position for the new token.
         position_ids = torch.full((1, 1), logical_seq_len, dtype=torch.long, device=device)
         cache_position = torch.arange(logical_seq_len, logical_seq_len + 1, dtype=torch.long, device=device)
+        # A single decode attention_mask is valid only when all layers share the
+        # same physical cache length.  Non-uniform budgets intentionally give
+        # layers different lengths, so we omit the padding mask in that case and
+        # keep RoPE correct with absolute position_ids/cache_position.
+        attention_mask = decode_attention_mask_for_cache(past_key_values, device)
         synchronize_if_cuda(device)
         step_start = time.perf_counter()
+        model_kwargs = {
+            "input_ids": current_ids,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+            "cache_position": cache_position,
+            "use_cache": True,
+            "return_dict": True,
+        }
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask
         with torch.no_grad():
-            outputs = model(
-                input_ids=current_ids,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-                cache_position=cache_position,
-                use_cache=True,
-            )
+            outputs = model(**model_kwargs)
             past_key_values = outputs.past_key_values
             next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1)
         synchronize_if_cuda(device)
@@ -437,6 +648,8 @@ def generate(
         generated.append(int(next_token.item()))
 
     total_time = ttft + sum(decode_times)
+    if output_attentions and original_attn_impl is not None:
+        model.config._attn_implementation = original_attn_impl
     generated_text = tokenizer.decode(generated, skip_special_tokens=True)
     generated_tensor = torch.tensor(generated, dtype=input_ids.dtype)
     full_ids = torch.cat([input_ids[0].detach().cpu(), generated_tensor]) if generated else input_ids[0].detach().cpu()
@@ -454,6 +667,11 @@ def generate(
         "total_time": total_time,
         "kv_cache_memory_bytes": approximate_kv_cache_bytes(past_key_values),
         "kv_cache_memory_mb": approximate_kv_cache_bytes(past_key_values) / (1024**2),
+        "achieved_compression_ratio": compression_stats.get("achieved_compression_ratio"),
+        "scoring_overhead_sec": compression_stats.get("scoring_overhead_sec", 0.0),
+        "compression_overhead_sec": compression_stats.get("compression_overhead_sec", 0.0),
+        "score_method_fallback": compression_stats.get("score_method_fallback", False),
+        "fallback_score_method": compression_stats.get("fallback_score_method"),
         "compression": compression_stats,
         "generated_text": generated_text,
         "full_text": full_text,
@@ -522,6 +740,11 @@ def generate_no_cache(
         "total_time": total_time,
         "kv_cache_memory_bytes": 0,
         "kv_cache_memory_mb": 0.0,
+        "achieved_compression_ratio": None,
+        "scoring_overhead_sec": 0.0,
+        "compression_overhead_sec": 0.0,
+        "score_method_fallback": False,
+        "fallback_score_method": None,
         "compression": {
             "achieved_compression_ratio": None,
             "original_tokens": 0,
@@ -571,7 +794,18 @@ def load_model_and_tokenizer(
         kwargs["attn_implementation"] = attn_implementation
 
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
+    except (TypeError, ValueError) as exc:
+        if "attn_implementation" not in kwargs:
+            raise
+        LOGGER.warning(
+            "This transformers/model combination did not accept attn_implementation=%r; "
+            "retrying without it. SnapKV will fall back to key_norm if attention weights remain unavailable.",
+            attn_implementation,
+        )
+        kwargs.pop("attn_implementation", None)
+        model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
     model.to(resolved_device)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token

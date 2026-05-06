@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 from typing import List
 
@@ -10,6 +11,7 @@ from pyramidsinkkv import (
     PyramidSinkKVConfig,
     cache_seq_length,
     compress_past_key_values,
+    decode_attention_mask_for_cache,
     load_model_and_tokenizer,
     normalize_budget_mode,
 )
@@ -25,18 +27,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compression_ratio", type=float, default=0.5)
     parser.add_argument("--sink_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=64)
+    parser.add_argument("--observation_window", type=int, default=32)
     parser.add_argument(
         "--budget_mode",
         choices=["no_cache", "dense", "uniform", "pyramid", "reversed", "spindle", "hourglass"],
         default="dense",
     )
-    parser.add_argument("--score_method", choices=["attention", "key_norm", "random"], default="key_norm")
+    parser.add_argument("--score_method", choices=["attention", "key_norm", "random", "snapkv"], default="key_norm")
     parser.add_argument("--output_json", default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num_samples", type=int, default=1, help="Useful for quick PG-19 single/few-sample runs.")
     parser.add_argument("--max_windows", type=int, default=8)
+    parser.add_argument("--debug_selection", action="store_true")
     return parser
 
 
@@ -96,20 +100,42 @@ def evaluate_window(model, input_ids, prefill_start, prefill_end, eval_end, conf
     if prefill_ids.numel() == 0 or eval_ids.numel() == 0:
         return [], None
 
-    output_attentions = (not dense) and config.score_method == "attention"
+    output_attentions = (not dense) and config.score_method in ("attention", "snapkv")
+    original_attn_impl = getattr(model.config, "_attn_implementation", None)
+    if output_attentions and original_attn_impl is not None:
+        model.config._attn_implementation = "eager"
     with torch.no_grad():
         outputs = model(
             input_ids=prefill_ids,
+            attention_mask=torch.ones_like(prefill_ids, device=device),
             use_cache=True,
             output_attentions=output_attentions,
+            return_dict=True,
         )
         past_key_values = outputs.past_key_values
         original_cache_len = cache_seq_length(past_key_values)
         if not dense:
-            past_key_values, stats = compress_past_key_values(past_key_values, config, outputs.attentions)
+            compression_start = time.perf_counter()
+            past_key_values, stats = compress_past_key_values(
+                past_key_values,
+                config,
+                getattr(outputs, "attentions", None),
+            )
+            stats["compression_overhead_sec"] = time.perf_counter() - compression_start
+            stats["scoring_overhead_sec"] = 0.0
+            if output_attentions:
+                stats["scoring_note"] = (
+                    "SnapKV/attention scoring used attention weights returned by the prefill pass; "
+                    "its overhead is included in window prefill time."
+                )
+                if getattr(model.config, "_attn_implementation", None) == "eager":
+                    model.config._attn_implementation = "sdpa"
+                    stats["decode_attention_implementation"] = "sdpa"
             compressed_cache_len = cache_seq_length(past_key_values)
             assert compressed_cache_len <= prefill_ids.shape[1]
-            if config.compression_ratio < 0.999:
+            if config.compression_ratio < 0.999 and compressed_cache_len == original_cache_len:
+                stats["note"] = "KV cache was not shortened because mandatory/safe tokens met or exceeded the budget."
+            elif config.compression_ratio < 0.999:
                 assert compressed_cache_len < original_cache_len, "non-dense PPL path did not compress KV cache"
         else:
             stats = None
@@ -124,17 +150,24 @@ def evaluate_window(model, input_ids, prefill_start, prefill_end, eval_end, conf
         nlls.append(float(loss_fct(next_token_logits, target).item()))
         position_ids = torch.full((1, 1), logical_seq_len, dtype=torch.long, device=device)
         cache_position = torch.arange(logical_seq_len, logical_seq_len + 1, dtype=torch.long, device=device)
+        attention_mask = decode_attention_mask_for_cache(past_key_values, device)
+        model_kwargs = {
+            "input_ids": target.view(1, 1),
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+            "cache_position": cache_position,
+            "use_cache": True,
+            "return_dict": True,
+        }
+        if attention_mask is not None:
+            model_kwargs["attention_mask"] = attention_mask
         with torch.no_grad():
-            out = model(
-                input_ids=target.view(1, 1),
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-                cache_position=cache_position,
-                use_cache=True,
-            )
+            out = model(**model_kwargs)
         past_key_values = out.past_key_values
         next_token_logits = out.logits[:, -1, :]
         logical_seq_len += 1
+    if output_attentions and original_attn_impl is not None:
+        model.config._attn_implementation = original_attn_impl
     return nlls, stats
 
 
@@ -169,15 +202,17 @@ def main():
         args.model_name_or_path,
         device=args.device,
         dtype=args.dtype,
-        attn_implementation="eager" if args.score_method == "attention" else None,
+        attn_implementation="eager" if args.score_method in ("attention", "snapkv") else None,
     )
     config = PyramidSinkKVConfig(
         compression_ratio=1.0 if dense or no_cache else args.compression_ratio,
         sink_size=args.sink_size,
         recent_size=args.recent_size,
+        observation_window=args.observation_window,
         budget_mode=budget_mode,
         score_method=args.score_method,
         seed=args.seed,
+        debug_selection=args.debug_selection,
     )
 
     texts = load_texts(args.dataset, args.split, args.num_samples)
@@ -217,13 +252,21 @@ def main():
         "split": args.split,
         "budget_mode": budget_mode,
         "score_method": args.score_method,
+        "observation_window": args.observation_window,
         "sink_size": args.sink_size,
         "recent_size": args.recent_size,
         "compression_ratio": 1.0 if dense or no_cache else args.compression_ratio,
+        "max_length": args.max_length,
+        "stride": args.stride,
         "num_tokens": len(all_nlls),
+        "evaluated_tokens": len(all_nlls),
         "num_windows": windows,
         "negative_log_likelihood": mean_nll,
+        "nll": mean_nll,
         "perplexity": ppl,
+        "ppl": ppl,
+        "score_method_fallback": any(item.get("score_method_fallback") for item in compression_stats),
+        "fallback_score_method": "key_norm" if any(item.get("score_method_fallback") for item in compression_stats) else None,
         "compression": compression_stats[:1],
     }
     if args.output_json:

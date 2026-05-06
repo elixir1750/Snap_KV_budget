@@ -25,17 +25,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compression_ratio", type=float, default=0.5)
     parser.add_argument("--sink_size", type=int, default=4)
     parser.add_argument("--recent_size", type=int, default=64)
+    parser.add_argument("--observation_window", type=int, default=32)
     parser.add_argument(
         "--budget_mode",
         choices=["no_cache", "dense", "uniform", "pyramid", "reversed", "spindle", "hourglass"],
         default=None,
     )
-    parser.add_argument("--score_method", choices=["attention", "key_norm", "random"], default=None)
+    parser.add_argument("--score_method", choices=["attention", "key_norm", "random", "snapkv"], default=None)
     parser.add_argument("--output_json", default=None)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup_runs", type=int, default=1)
+    parser.add_argument("--debug_selection", action="store_true")
     return parser
 
 
@@ -49,6 +51,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="uniform",
                 score_method="key_norm",
                 seed=args.seed,
@@ -60,6 +63,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="uniform",
                 score_method="random",
                 seed=args.seed,
@@ -71,6 +75,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="pyramid",
                 score_method="key_norm",
                 seed=args.seed,
@@ -82,6 +87,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="pyramid",
                 score_method="random",
                 seed=args.seed,
@@ -93,6 +99,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="reversed",
                 score_method="key_norm",
                 seed=args.seed,
@@ -104,6 +111,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="spindle",
                 score_method="key_norm",
                 seed=args.seed,
@@ -115,6 +123,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="spindle",
                 score_method="random",
                 seed=args.seed,
@@ -126,6 +135,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="hourglass",
                 score_method="key_norm",
                 seed=args.seed,
@@ -137,6 +147,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="hourglass",
                 score_method="random",
                 seed=args.seed,
@@ -148,6 +159,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=0,
                 recent_size=args.recent_size,
+                observation_window=args.observation_window,
                 budget_mode="pyramid",
                 score_method="key_norm",
                 seed=args.seed,
@@ -159,6 +171,7 @@ def default_methods(args):
                 compression_ratio=args.compression_ratio,
                 sink_size=args.sink_size,
                 recent_size=0,
+                observation_window=args.observation_window,
                 budget_mode="pyramid",
                 score_method="key_norm",
                 seed=args.seed,
@@ -169,7 +182,7 @@ def default_methods(args):
 
 def main():
     args = build_arg_parser().parse_args()
-    requested_attn = args.score_method == "attention"
+    requested_attn = args.score_method in ("attention", "snapkv")
     model, tokenizer, device = load_model_and_tokenizer(
         args.model_name_or_path,
         device=args.device,
@@ -187,9 +200,11 @@ def main():
                     compression_ratio=1.0 if mode in ("dense", "no_cache") else args.compression_ratio,
                     sink_size=args.sink_size,
                     recent_size=args.recent_size,
+                    observation_window=args.observation_window,
                     budget_mode=mode,
                     score_method=score_method,
                     seed=args.seed,
+                    debug_selection=args.debug_selection,
                 ),
             )
         ]
@@ -210,12 +225,15 @@ def main():
         results.append(item)
         print(
             f"  TTFT={item['ttft']:.4f}s TPOT={item['tpot']:.4f}s "
-            f"throughput={item['throughput']:.2f} tok/s KV={item['kv_cache_memory_mb']:.2f} MB"
+            f"throughput={item['throughput']:.2f} tok/s KV={item['kv_cache_memory_mb']:.2f} MB "
+            f"scoring_overhead={item.get('compression', {}).get('scoring_overhead_sec', 0.0):.4f}s "
+            f"compression_overhead={item.get('compression', {}).get('compression_overhead_sec', 0.0):.4f}s"
         )
 
     payload = {
         "model_name_or_path": args.model_name_or_path,
         "max_new_tokens": args.max_new_tokens,
+        "observation_window": args.observation_window,
         "prompt": args.prompt,
         "results": results,
     }
