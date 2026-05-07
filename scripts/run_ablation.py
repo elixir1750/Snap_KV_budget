@@ -29,8 +29,12 @@ def build_arg_parser():
     parser.add_argument("--compression_ratio", type=float, default=0.5)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", default="auto")
-    parser.add_argument("--dataset", choices=["wikitext", "pg19"], default="wikitext")
+    parser.add_argument("--dataset", choices=["wikitext", "pg19", "redpajama"], default="wikitext")
     parser.add_argument("--split", default="test")
+    parser.add_argument("--redpajama_file", default="book_sample.jsonl")
+    parser.add_argument("--redpajama_source", choices=["sample_file", "hub"], default="sample_file")
+    parser.add_argument("--redpajama_hub_dataset", default="togethercomputer/RedPajama-Data-1T")
+    parser.add_argument("--redpajama_hub_config", default="wikipedia")
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--stride", type=int, default=128)
     parser.add_argument("--observation_window", type=int, default=32)
@@ -142,6 +146,14 @@ def run_ppl_once(args, ablation, raw_dir, idx, name, seed):
         args.dataset,
         "--split",
         args.split,
+        "--redpajama_file",
+        args.redpajama_file,
+        "--redpajama_source",
+        args.redpajama_source,
+        "--redpajama_hub_dataset",
+        args.redpajama_hub_dataset,
+        "--redpajama_hub_config",
+        args.redpajama_hub_config,
         "--max_length",
         str(args.max_length),
         "--stride",

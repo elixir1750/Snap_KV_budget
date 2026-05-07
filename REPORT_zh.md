@@ -91,6 +91,80 @@ python -m scripts.run_ablation \
 
 表格指标包括 `ppl`、`ttft`、`tpot`、`throughput`、`total_time`、`kv_cache_memory_mb`、`achieved_compression_ratio`、`scoring_overhead_sec`、`snapkv_fallback_status` 和 `notes`。如果 `score_method=snapkv` 回退到 `key_norm`，该行必须标记为 `fallback_to_key_norm`，并且不能解释为真正的 SnapKV 结果。
 
+### GPU 实验流程
+
+GPU 实验建议使用同一个 `pyramidsinkkv` conda 环境，并先确认 CUDA 可见：
+
+```bash
+conda activate pyramidsinkkv
+python - <<'PY'
+import torch
+print(torch.__version__)
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no cuda")
+PY
+```
+
+如果需要镜像站下载模型，可以设置：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+如果公共数据集出现 `Invalid username or password`，通常是本地 token 或镜像认证状态异常，可先清理：
+
+```bash
+unset HF_TOKEN
+unset HUGGING_FACE_HUB_TOKEN
+```
+
+GPU 版主实验命令：
+
+```bash
+python -m scripts.run_ablation \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --compression_ratio 0.5 \
+  --max_new_tokens 256 \
+  --dataset wikitext \
+  --split test \
+  --max_length 1024 \
+  --stride 128 \
+  --max_windows 2 \
+  --score_methods random,snapkv \
+  --budget_modes uniform,pyramid,reversed,spindle,hourglass \
+  --device cuda \
+  --dtype float16 \
+  --generation_repeats 5 \
+  --results_dir results/gpu_wikitext_ablation
+```
+
+RedPajama 长文本 probe 可以直接读取 full repo 的 URL list，避免执行旧版 dataset script：
+
+```bash
+python -m scripts.eval_ppl \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --dataset redpajama \
+  --redpajama_source hub \
+  --redpajama_hub_config wikipedia \
+  --split train \
+  --num_samples 8 \
+  --max_length 2048 \
+  --stride 256 \
+  --max_windows 2 \
+  --compression_ratio 0.25 \
+  --sink_size 4 \
+  --recent_size 64 \
+  --observation_window 32 \
+  --budget_mode spindle \
+  --score_method snapkv \
+  --seed 0 \
+  --device cuda \
+  --dtype float16 \
+  --output_json results/gpu_redpajama_spindle_025_len2048_stride256/spindle_snapkv_seed0_ppl.json
+```
+
+random 对照需要多 seed，例如 `0,1,2,3,4`，最后报告 PPL 的 mean +/- std；SnapKV 是确定性的，通常跑一个 seed 即可。GPU generation benchmark 内部使用 `torch.cuda.synchronize()` 做 CUDA 计时，因此 TTFT/TPOT/throughput 比 CPU timing 更适合作为速度参考。当前实现为了拿 attention weights 会在 prefill 阶段使用 eager attention，TTFT 里包含这部分开销。
+
 ## 主实验表格
 
 见 `GROUP_REPORT_TABLES_zh.md`。如果尚未运行真实实验，表格保留 TODO，不填入虚构数字。

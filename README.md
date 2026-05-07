@@ -283,6 +283,84 @@ python -m scripts.run_ablation \
   --budget_modes uniform,pyramid,reversed,spindle,hourglass
 ```
 
+## GPU Experiment Workflow
+
+Use the `pyramidsinkkv` conda environment and confirm CUDA is visible:
+
+```bash
+conda activate pyramidsinkkv
+python - <<'PY'
+import torch
+print(torch.__version__)
+print(torch.cuda.is_available())
+print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no cuda")
+PY
+```
+
+For HuggingFace access in China, the mirror can be useful for model files:
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+If a public dataset reports `Invalid username or password`, clear stale tokens:
+
+```bash
+unset HF_TOKEN
+unset HUGGING_FACE_HUB_TOKEN
+```
+
+Run the grouped WikiText ablation on GPU:
+
+```bash
+python -m scripts.run_ablation \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --compression_ratio 0.5 \
+  --max_new_tokens 256 \
+  --dataset wikitext \
+  --split test \
+  --max_length 1024 \
+  --stride 128 \
+  --max_windows 2 \
+  --score_methods random,snapkv \
+  --budget_modes uniform,pyramid,reversed,spindle,hourglass \
+  --device cuda \
+  --dtype float16 \
+  --generation_repeats 5 \
+  --results_dir results/gpu_wikitext_ablation
+```
+
+Run the longer RedPajama probe on GPU without executing the legacy dataset
+script:
+
+```bash
+python -m scripts.eval_ppl \
+  --model_name_or_path EleutherAI/pythia-70m \
+  --dataset redpajama \
+  --redpajama_source hub \
+  --redpajama_hub_config wikipedia \
+  --split train \
+  --num_samples 8 \
+  --max_length 2048 \
+  --stride 256 \
+  --max_windows 2 \
+  --compression_ratio 0.25 \
+  --sink_size 4 \
+  --recent_size 64 \
+  --observation_window 32 \
+  --budget_mode spindle \
+  --score_method snapkv \
+  --seed 0 \
+  --device cuda \
+  --dtype float16 \
+  --output_json results/gpu_redpajama_spindle_025_len2048_stride256/spindle_snapkv_seed0_ppl.json
+```
+
+For the matching random baseline, repeat the RedPajama command with
+`--score_method random` and seeds such as `0,1,2,3,4`, then report mean and
+standard deviation for PPL.  CUDA timings use `torch.cuda.synchronize()` in the
+benchmark script; `eval_ppl.py` reports PPL rather than generation speed.
+
 The markdown table is intended to be copied directly into the final course
 report.  If an experiment fails, the runner records the error in the notes
 instead of inventing a result.

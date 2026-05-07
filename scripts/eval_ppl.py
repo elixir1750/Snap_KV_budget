@@ -1,9 +1,13 @@
 import argparse
+import gzip
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import List
+import urllib.error
+import urllib.request
 
 import torch
 
@@ -20,8 +24,32 @@ from pyramidsinkkv import (
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate continuation PPL with optional PyramidSinkKV compression.")
     parser.add_argument("--model_name_or_path", default="EleutherAI/pythia-70m")
-    parser.add_argument("--dataset", choices=["wikitext", "pg19"], default="wikitext")
+    parser.add_argument("--dataset", choices=["wikitext", "pg19", "redpajama"], default="wikitext")
     parser.add_argument("--split", default="test")
+    parser.add_argument(
+        "--redpajama_file",
+        default="book_sample.jsonl",
+        help="RedPajama-Data-1T-Sample JSONL file or local path, e.g. book_sample.jsonl.",
+    )
+    parser.add_argument(
+        "--redpajama_source",
+        choices=["sample_file", "hub"],
+        default="sample_file",
+        help="Use a local/sample JSONL file or stream directly from togethercomputer/RedPajama-Data-1T.",
+    )
+    parser.add_argument(
+        "--redpajama_hub_dataset",
+        default="togethercomputer/RedPajama-Data-1T",
+        help="Hub dataset id used when --redpajama_source hub.",
+    )
+    parser.add_argument(
+        "--redpajama_hub_config",
+        default="wikipedia",
+        help=(
+            "RedPajama hub config/subset used when --redpajama_source hub. "
+            "Common values: wikipedia, stackexchange, arxiv, c4, github, common_crawl, default."
+        ),
+    )
     parser.add_argument("--max_length", type=int, default=1024, help="Prefill context length.")
     parser.add_argument("--stride", type=int, default=128, help="Number of continuation tokens scored per window.")
     parser.add_argument("--compression_ratio", type=float, default=0.5)
@@ -44,7 +72,96 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_texts(dataset_name: str, split: str, num_samples: int):
+def _request_url(url: str, include_auth: bool = True):
+    headers = {"User-Agent": "PyramidSinkKV/RedPajama-loader"}
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if include_auth and token and "huggingface.co" in url:
+        headers["Authorization"] = f"Bearer {token}"
+    return urllib.request.Request(url, headers=headers)
+
+
+def _read_text(url: str, timeout: int = 60) -> str:
+    try:
+        with urllib.request.urlopen(_request_url(url), timeout=timeout) as response:
+            return response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403) and (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
+            with urllib.request.urlopen(_request_url(url, include_auth=False), timeout=timeout) as response:
+                return response.read().decode("utf-8")
+        raise RuntimeError(f"Failed to fetch {url}: HTTP {exc.code} {exc.reason}") from exc
+
+
+def _iter_jsonl_url(url: str, timeout: int = 120):
+    try:
+        response = urllib.request.urlopen(_request_url(url), timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (401, 403) or not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")):
+            raise
+        response = urllib.request.urlopen(_request_url(url, include_auth=False), timeout=timeout)
+    with response:
+        raw_stream = gzip.GzipFile(fileobj=response) if url.endswith(".gz") else response
+        for raw_line in raw_stream:
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            yield json.loads(line)
+
+
+def load_redpajama_hub_texts(
+    dataset_id: str,
+    subset: str,
+    num_samples: int,
+):
+    """Load RedPajama text without executing the dataset script.
+
+    Recent ``datasets`` releases reject old dataset scripts such as
+    ``RedPajama-Data-1T.py``.  The RedPajama repo also ships tiny URL-list
+    files, so for quick PPL probes we read ``urls/<subset>.txt`` and stream the
+    first JSONL rows directly from Together's data host.
+    """
+
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    subset = subset or "wikipedia"
+    urls_list = f"{endpoint}/datasets/{dataset_id}/resolve/main/urls/{subset}.txt"
+    try:
+        data_urls = [line.strip() for line in _read_text(urls_list).splitlines() if line.strip()]
+    except RuntimeError:
+        if endpoint == "https://huggingface.co":
+            raise
+        urls_list = f"https://huggingface.co/datasets/{dataset_id}/resolve/main/urls/{subset}.txt"
+        print(f"[redpajama] failed to fetch URL list from {endpoint}; retrying with huggingface.co.")
+        data_urls = [line.strip() for line in _read_text(urls_list).splitlines() if line.strip()]
+    if not data_urls:
+        raise RuntimeError(f"No data URLs found in {urls_list}")
+
+    texts = []
+    errors = []
+    for data_url in data_urls:
+        try:
+            for row in _iter_jsonl_url(data_url):
+                text = row.get("text", "")
+                if text and text.strip():
+                    texts.append(text)
+                if len(texts) >= max(1, num_samples):
+                    return ["\n\n".join(texts)]
+        except Exception as exc:  # pragma: no cover - depends on remote data availability.
+            errors.append(f"{data_url}: {exc}")
+            continue
+    raise RuntimeError(
+        f"No text rows were loaded from RedPajama subset={subset}. "
+        f"Recent URL errors: {' | '.join(errors[-3:])}"
+    )
+
+
+def load_texts(
+    dataset_name: str,
+    split: str,
+    num_samples: int,
+    redpajama_file: str = "book_sample.jsonl",
+    redpajama_source: str = "sample_file",
+    redpajama_hub_dataset: str = "togethercomputer/RedPajama-Data-1T",
+    redpajama_hub_config: str = "wikipedia",
+):
     if dataset_name == "wikitext":
         try:
             from datasets import load_dataset
@@ -58,6 +175,31 @@ def load_texts(dataset_name: str, split: str, num_samples: int):
         text = "\n\n".join(t for t in dataset["text"] if t.strip())
         return [text]
     from datasets import load_dataset
+
+    if dataset_name == "redpajama":
+        if redpajama_source == "hub":
+            if split != "train":
+                print("[redpajama] full RedPajama URL lists are train-only; ignoring --split and streaming train rows.")
+            return load_redpajama_hub_texts(redpajama_hub_dataset, redpajama_hub_config, num_samples)
+
+        data_file = redpajama_file
+        if not Path(data_file).exists() and "://" not in data_file:
+            endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+            data_file = (
+                f"{endpoint}/datasets/togethercomputer/RedPajama-Data-1T-Sample/"
+                f"resolve/main/{redpajama_file}"
+            )
+        dataset = load_dataset("json", data_files=data_file, split="train", streaming=True)
+        texts = []
+        for row in dataset:
+            text = row.get("text", "")
+            if text and text.strip():
+                texts.append(text)
+            if len(texts) >= max(1, num_samples):
+                break
+        if not texts:
+            raise RuntimeError(f"No text rows were loaded from RedPajama file: {data_file}")
+        return ["\n\n".join(texts)]
 
     dataset = load_dataset("pg19", split=split)
     texts = []
@@ -215,7 +357,15 @@ def main():
         debug_selection=args.debug_selection,
     )
 
-    texts = load_texts(args.dataset, args.split, args.num_samples)
+    texts = load_texts(
+        args.dataset,
+        args.split,
+        args.num_samples,
+        args.redpajama_file,
+        args.redpajama_source,
+        args.redpajama_hub_dataset,
+        args.redpajama_hub_config,
+    )
     all_nlls = []
     compression_stats = []
     windows = 0
@@ -250,6 +400,10 @@ def main():
         "model_name_or_path": args.model_name_or_path,
         "dataset": args.dataset,
         "split": args.split,
+        "redpajama_file": args.redpajama_file if args.dataset == "redpajama" else None,
+        "redpajama_source": args.redpajama_source if args.dataset == "redpajama" else None,
+        "redpajama_hub_dataset": args.redpajama_hub_dataset if args.dataset == "redpajama" else None,
+        "redpajama_hub_config": args.redpajama_hub_config if args.dataset == "redpajama" else None,
         "budget_mode": budget_mode,
         "score_method": args.score_method,
         "observation_window": args.observation_window,
