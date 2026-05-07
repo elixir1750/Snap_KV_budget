@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 
 try:
     from transformers.cache_utils import DynamicCache
@@ -43,6 +44,7 @@ class PyramidSinkKVConfig:
     budget_mode: str = "pyramid"
     score_method: str = "key_norm"
     observation_window: int = 32
+    snapkv_pooling_kernel: int = 1
     seed: int = 0
     safe_min_length: int = 8
     debug_selection: bool = False
@@ -251,12 +253,16 @@ def _snapkv_attention_scores(
     attention: Optional[torch.Tensor],
     seq_len: int,
     observation_window: int,
+    pooling_kernel: int = 1,
 ) -> Optional[torch.Tensor]:
     """Compute SnapKV-style scores from recent queries to all prompt keys.
 
     HF GPTNeoX attentions are normally ``[batch, heads, query_len, key_len]``.
     We explicitly validate this shape and average the last observation-window
     query rows over batch, heads, and query positions, yielding ``[seq_len]``.
+    When ``pooling_kernel`` is greater than one, apply a length-preserving 1D
+    average pooling pass over the sequence dimension.  This keeps the current
+    head-agnostic cache format while adding SnapKV's local continuity bias.
     """
 
     if attention is None or not torch.is_tensor(attention):
@@ -271,6 +277,15 @@ def _snapkv_attention_scores(
     score = recent_attn.float().mean(dim=(0, 1, 2))
     if score.ndim != 1 or int(score.shape[0]) != seq_len:
         return None
+    kernel = int(pooling_kernel)
+    if kernel > 1 and score.numel() > 1:
+        kernel = min(kernel, int(score.numel()))
+        pad_left = (kernel - 1) // 2
+        pad_right = kernel // 2
+        pooled = F.avg_pool1d(F.pad(score.view(1, 1, -1), (pad_left, pad_right), mode="replicate"), kernel_size=kernel, stride=1)
+        score = pooled.view(-1)
+        if score.ndim != 1 or int(score.shape[0]) != seq_len:
+            return None
     return score
 
 
@@ -304,7 +319,12 @@ def _select_middle_by_method(
             method = "key_norm"
             fallback = True
     elif method == "snapkv":
-        scores = _snapkv_attention_scores(attention, seq_len, config.observation_window)
+        scores = _snapkv_attention_scores(
+            attention,
+            seq_len,
+            config.observation_window,
+            config.snapkv_pooling_kernel,
+        )
         if scores is None:
             LOGGER.warning(
                 "SnapKV attention weights are unavailable; falling back to key_norm. layer=%s",

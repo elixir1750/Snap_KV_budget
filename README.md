@@ -74,6 +74,9 @@ Selection methods:
   attention weights, averages the last `--observation_window` query positions
   over batch, heads, and query positions, and selects the highest-scoring middle
   tokens for each layer. Sink tokens and recent tokens are still always kept.
+  Set `--snapkv_pooling_kernel` to an odd value such as `3` or `5` to apply
+  length-preserving 1D average pooling over the token scores before top-k
+  selection; the default `1` preserves the earlier no-pooling behavior.
 
 SnapKV requires attention weights. The loader requests eager attention when
 possible via `attn_implementation="eager"` and retries without it on older
