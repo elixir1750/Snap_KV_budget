@@ -105,6 +105,22 @@ def test_snapkv_score_shape_is_seq_len():
     assert scores.shape == (12,)
 
 
+def test_snapkv_pooling_spreads_local_importance():
+    attention = torch.zeros(1, 1, 4, 8)
+    attention[:, :, -2:, 4] = 9.0
+
+    raw_scores = _snapkv_attention_scores(attention, seq_len=8, observation_window=2, pooling_kernel=1)
+    pooled_scores = _snapkv_attention_scores(attention, seq_len=8, observation_window=2, pooling_kernel=3)
+
+    assert raw_scores is not None
+    assert pooled_scores is not None
+    assert raw_scores.argmax().item() == 4
+    assert pooled_scores.shape == (8,)
+    assert pooled_scores[3].item() > 0.0
+    assert pooled_scores[4].item() > 0.0
+    assert pooled_scores[5].item() > 0.0
+
+
 def test_snapkv_fallback_to_key_norm_is_recorded_when_attentions_unavailable():
     layers = []
     for _ in range(2):
@@ -133,4 +149,5 @@ if __name__ == "__main__":
     test_selected_indices_sorted_unique_and_preserve_sink_recent()
     test_gather_kv_length_matches_selected_indices()
     test_snapkv_score_shape_is_seq_len()
+    test_snapkv_pooling_spreads_local_importance()
     test_snapkv_fallback_to_key_norm_is_recorded_when_attentions_unavailable()

@@ -27,7 +27,7 @@ recent_attn = attentions[layer][:, :, -observation_window:, :]
 score = recent_attn.mean(dim=(0, 1, 2))
 ```
 
-得到形状为 `[seq_len]` 的分数后，只在中间区域做 top-k，最后将 sink、SnapKV middle、recent 合并去重并按原始位置排序，以保证压缩后的 K/V 仍保持原始 token 顺序。
+得到形状为 `[seq_len]` 的分数后，可以通过 `--snapkv_pooling_kernel` 对序列维度做长度保持的一维平均池化；默认值 `1` 表示不做 pooling，`3` 或 `5` 可用于测试局部连续性假设。随后只在中间区域做 top-k，最后将 sink、SnapKV middle、recent 合并去重并按原始位置排序，以保证压缩后的 K/V 仍保持原始 token 顺序。
 
 ## Layer-wise Budget 的作用
 

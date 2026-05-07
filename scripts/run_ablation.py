@@ -38,6 +38,7 @@ def build_arg_parser():
     parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--stride", type=int, default=128)
     parser.add_argument("--observation_window", type=int, default=32)
+    parser.add_argument("--snapkv_pooling_kernel", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--max_windows", type=int, default=2)
     parser.add_argument("--results_dir", default="results")
@@ -166,6 +167,8 @@ def run_ppl_once(args, ablation, raw_dir, idx, name, seed):
         str(ablation["recent_size"]),
         "--observation_window",
         str(args.observation_window),
+        "--snapkv_pooling_kernel",
+        str(args.snapkv_pooling_kernel),
         "--budget_mode",
         ablation["budget_mode"],
         "--score_method",
@@ -210,6 +213,8 @@ def run_generation_once(args, ablation, raw_dir, idx, name, repeat_idx):
         str(ablation["recent_size"]),
         "--observation_window",
         str(args.observation_window),
+        "--snapkv_pooling_kernel",
+        str(args.snapkv_pooling_kernel),
         "--budget_mode",
         ablation["budget_mode"],
         "--score_method",
