@@ -45,6 +45,7 @@ class PyramidSinkKVConfig:
     score_method: str = "key_norm"
     observation_window: int = 32
     snapkv_pooling_kernel: int = 1
+    snapkv_head_aggregation: str = "mean"
     seed: int = 0
     safe_min_length: int = 8
     debug_selection: bool = False
@@ -249,17 +250,37 @@ def _attention_scores(attention: Optional[torch.Tensor], seq_len: int, recent_si
     return _snapkv_attention_scores(attention, seq_len, recent_size)
 
 
+def _pool_scores_1d(scores: torch.Tensor, pooling_kernel: int) -> torch.Tensor:
+    """Apply length-preserving 1D average pooling over the last dimension."""
+
+    kernel = int(pooling_kernel)
+    seq_len = int(scores.shape[-1])
+    if kernel <= 1 or seq_len <= 1:
+        return scores
+    kernel = min(kernel, seq_len)
+    pad_left = (kernel - 1) // 2
+    pad_right = kernel // 2
+    leading_shape = scores.shape[:-1]
+    flat = scores.reshape(-1, 1, seq_len)
+    padded = F.pad(flat, (pad_left, pad_right), mode="replicate")
+    pooled = F.avg_pool1d(padded, kernel_size=kernel, stride=1)
+    return pooled.reshape(*leading_shape, seq_len)
+
+
 def _snapkv_attention_scores(
     attention: Optional[torch.Tensor],
     seq_len: int,
     observation_window: int,
     pooling_kernel: int = 1,
+    head_aggregation: str = "mean",
 ) -> Optional[torch.Tensor]:
     """Compute SnapKV-style scores from recent queries to all prompt keys.
 
     HF GPTNeoX attentions are normally ``[batch, heads, query_len, key_len]``.
     We explicitly validate this shape and average the last observation-window
-    query rows over batch, heads, and query positions, yielding ``[seq_len]``.
+    query rows over batch and query positions.  Head scores can then be
+    aggregated with ``mean`` or ``max`` to yield ``[seq_len]``, or kept as
+    ``[heads, seq_len]`` with ``per_head`` for true per-head SnapKV selection.
     When ``pooling_kernel`` is greater than one, apply a length-preserving 1D
     average pooling pass over the sequence dimension.  This keeps the current
     head-agnostic cache format while adding SnapKV's local continuity bias.
@@ -274,18 +295,26 @@ def _snapkv_attention_scores(
     window = min(max(int(observation_window), 1), int(attention.shape[-2]))
     key_start = int(attention.shape[-1]) - seq_len
     recent_attn = attention[:, :, -window:, key_start:]
-    score = recent_attn.float().mean(dim=(0, 1, 2))
+    per_head_score = recent_attn.float().mean(dim=(0, 2))
+    if per_head_score.ndim != 2 or int(per_head_score.shape[-1]) != seq_len:
+        return None
+    aggregation = str(head_aggregation).lower()
+    if aggregation == "per_head":
+        score = _pool_scores_1d(per_head_score, pooling_kernel)
+        if score.ndim != 2 or int(score.shape[-1]) != seq_len:
+            return None
+        return score
+    if aggregation == "mean":
+        score = per_head_score.mean(dim=0)
+    elif aggregation == "max":
+        score = per_head_score.max(dim=0).values
+    else:
+        raise ValueError(f"Unsupported snapkv_head_aggregation: {head_aggregation}")
     if score.ndim != 1 or int(score.shape[0]) != seq_len:
         return None
-    kernel = int(pooling_kernel)
-    if kernel > 1 and score.numel() > 1:
-        kernel = min(kernel, int(score.numel()))
-        pad_left = (kernel - 1) // 2
-        pad_right = kernel // 2
-        pooled = F.avg_pool1d(F.pad(score.view(1, 1, -1), (pad_left, pad_right), mode="replicate"), kernel_size=kernel, stride=1)
-        score = pooled.view(-1)
-        if score.ndim != 1 or int(score.shape[0]) != seq_len:
-            return None
+    score = _pool_scores_1d(score, pooling_kernel)
+    if score.ndim != 1 or int(score.shape[0]) != seq_len:
+        return None
     return score
 
 
@@ -324,6 +353,7 @@ def _select_middle_by_method(
             seq_len,
             config.observation_window,
             config.snapkv_pooling_kernel,
+            config.snapkv_head_aggregation,
         )
         if scores is None:
             LOGGER.warning(
@@ -337,23 +367,42 @@ def _select_middle_by_method(
         scores = _key_norm_scores(key)
     if scores is None:
         raise ValueError(f"Unsupported score_method: {method}")
-    middle_scores = scores[candidates]
-    top = torch.topk(middle_scores, k=remaining, largest=True).indices
-    return candidates[top], method, fallback
+    if scores.ndim == 1:
+        middle_scores = scores[candidates]
+        top = torch.topk(middle_scores, k=remaining, largest=True).indices
+        return candidates[top], method, fallback
+    if scores.ndim == 2:
+        middle_scores = scores[:, candidates]
+        top = torch.topk(middle_scores, k=remaining, dim=-1, largest=True).indices
+        return candidates[top], method, fallback
+    raise ValueError(f"Expected 1D or 2D scores, got shape {tuple(scores.shape)}")
 
 
 def gather_kv_by_indices(key: torch.Tensor, value: torch.Tensor, selected_indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Gather K/V along the sequence dimension only."""
+    """Gather K/V along the sequence dimension only.
+
+    ``selected_indices`` may be 1D ``[keep_len]`` for head-agnostic selection
+    or 2D ``[heads, keep_len]`` for per-head SnapKV selection.
+    """
 
     seq_len = get_seq_len_from_kv(key)
     assert_valid_selected_indices(selected_indices, seq_len)
     if value.ndim != 4 or int(value.shape[-2]) != seq_len:
         raise ValueError(f"Expected value tensor [batch, heads, seq, dim], got shape {tuple(value.shape)}")
-    gather_idx = selected_indices.view(1, 1, -1, 1).expand(key.shape[0], key.shape[1], -1, key.shape[-1])
+    if selected_indices.ndim == 1:
+        gather_idx = selected_indices.view(1, 1, -1, 1).expand(key.shape[0], key.shape[1], -1, key.shape[-1])
+        value_idx = selected_indices.view(1, 1, -1, 1).expand(value.shape[0], value.shape[1], -1, value.shape[-1])
+    else:
+        if int(selected_indices.shape[0]) != int(key.shape[1]):
+            raise AssertionError(
+                f"per-head selected indices must have one row per head: "
+                f"indices={tuple(selected_indices.shape)} key={tuple(key.shape)}"
+            )
+        gather_idx = selected_indices.view(1, key.shape[1], -1, 1).expand(key.shape[0], key.shape[1], -1, key.shape[-1])
+        value_idx = selected_indices.view(1, value.shape[1], -1, 1).expand(value.shape[0], value.shape[1], -1, value.shape[-1])
     compressed_key = torch.gather(key, dim=2, index=gather_idx)
-    value_idx = selected_indices.view(1, 1, -1, 1).expand(value.shape[0], value.shape[1], -1, value.shape[-1])
     compressed_value = torch.gather(value, dim=2, index=value_idx)
-    expected = int(selected_indices.numel())
+    expected = int(selected_indices.shape[-1])
     if int(compressed_key.shape[-2]) != expected or int(compressed_value.shape[-2]) != expected:
         raise AssertionError("compressed K/V length does not match selected indices length")
     return compressed_key.contiguous(), compressed_value.contiguous()
@@ -361,25 +410,41 @@ def gather_kv_by_indices(key: torch.Tensor, value: torch.Tensor, selected_indice
 
 def _selection_summary(indices: torch.Tensor, seq_len: int) -> Dict[str, Any]:
     cpu = indices.detach().cpu()
-    gaps = (cpu[1:] - cpu[:-1]) if cpu.numel() > 1 else torch.empty(0, dtype=cpu.dtype)
-    return {
-        "selected_indices": [int(x) for x in cpu.tolist()],
-        "num_selected": int(cpu.numel()),
-        "min_selected_index": int(cpu.min().item()) if cpu.numel() else None,
-        "max_selected_index": int(cpu.max().item()) if cpu.numel() else None,
-        "average_selected_index": float(cpu.float().mean().item()) if cpu.numel() else None,
+    if cpu.ndim == 1:
+        rows = cpu.view(1, -1)
+    else:
+        rows = cpu
+    gaps = (rows[:, 1:] - rows[:, :-1]) if rows.shape[-1] > 1 else torch.empty(0, dtype=cpu.dtype)
+    payload = {
+        "selected_indices": [int(x) for x in rows[0].tolist()],
+        "num_selected": int(rows.shape[-1]),
+        "num_heads": int(rows.shape[0]) if cpu.ndim == 2 else None,
+        "min_selected_index": int(rows.min().item()) if rows.numel() else None,
+        "max_selected_index": int(rows.max().item()) if rows.numel() else None,
+        "average_selected_index": float(rows.float().mean().item()) if rows.numel() else None,
         "max_gap": int(gaps.max().item()) if gaps.numel() else 0,
         "average_gap": float(gaps.float().mean().item()) if gaps.numel() else 0.0,
         "seq_len": int(seq_len),
     }
+    if cpu.ndim == 2:
+        payload["selected_indices_by_head"] = [[int(x) for x in row.tolist()] for row in rows]
+    return payload
 
 
 def _overlap_ratio(left: torch.Tensor, right: torch.Tensor) -> float:
     if left.numel() == 0:
         return 0.0
-    left_set = set(int(x) for x in left.detach().cpu().tolist())
-    right_set = set(int(x) for x in right.detach().cpu().tolist())
-    return len(left_set & right_set) / max(len(left_set), 1)
+    left_cpu = left.detach().cpu()
+    right_cpu = right.detach().cpu()
+    left_rows = left_cpu.view(1, -1) if left_cpu.ndim == 1 else left_cpu
+    right_rows = right_cpu.view(1, -1) if right_cpu.ndim == 1 else right_cpu
+    overlaps = []
+    for idx, left_row in enumerate(left_rows):
+        right_row = right_rows[idx] if right_rows.shape[0] == left_rows.shape[0] else right_rows[0]
+        left_set = set(int(x) for x in left_row.tolist())
+        right_set = set(int(x) for x in right_row.tolist())
+        overlaps.append(len(left_set & right_set) / max(len(left_set), 1))
+    return float(sum(overlaps) / max(len(overlaps), 1))
 
 
 def _save_selection_debug(
@@ -458,8 +523,15 @@ def select_token_indices(
 
     middle, method, fallback = _select_middle_by_method(key, candidates, remaining, config.score_method, config, layer_idx, attention)
 
-    selected = torch.cat([mandatory, middle])
-    selected = torch.unique(selected, sorted=True)
+    if middle.ndim == 1:
+        selected = torch.cat([mandatory, middle])
+        selected = torch.unique(selected, sorted=True)
+    elif middle.ndim == 2:
+        mandatory_rows = mandatory.view(1, -1).expand(middle.shape[0], -1)
+        selected = torch.cat([mandatory_rows, middle], dim=-1)
+        selected = torch.sort(selected, dim=-1).values
+    else:
+        raise ValueError(f"Expected 1D or 2D middle indices, got shape {tuple(middle.shape)}")
     assert_valid_selected_indices(selected, seq_len)
     _save_selection_debug(key, selected, keep_count, config, layer_idx, attention, method)
     return selected, method, fallback
@@ -468,16 +540,20 @@ def select_token_indices(
 def assert_valid_selected_indices(indices: torch.Tensor, seq_len: int) -> None:
     """Defensive checks for compressed KV gather indices."""
 
-    if indices.ndim != 1:
-        raise AssertionError(f"selected indices must be 1D, got {tuple(indices.shape)}")
+    if indices.ndim not in (1, 2):
+        raise AssertionError(f"selected indices must be 1D or 2D, got {tuple(indices.shape)}")
     if indices.numel() == 0:
         raise AssertionError("selected indices must not be empty")
     if torch.any(indices < 0) or torch.any(indices >= seq_len):
         raise AssertionError(f"selected indices out of range [0, {seq_len})")
-    if indices.numel() > 1:
+    if indices.ndim == 1 and indices.numel() > 1:
         diffs = indices[1:] - indices[:-1]
         if torch.any(diffs <= 0):
             raise AssertionError("selected indices must be sorted and unique")
+    if indices.ndim == 2 and indices.shape[-1] > 1:
+        diffs = indices[:, 1:] - indices[:, :-1]
+        if torch.any(diffs <= 0):
+            raise AssertionError("selected indices must be sorted and unique per head")
 
 
 def compress_past_key_values(
@@ -509,6 +585,7 @@ def compress_past_key_values(
         indices, used_method, fallback = select_token_indices(key, target_keep, config, layer_idx, attention)
 
         compressed_key, compressed_value = gather_kv_by_indices(key, value, indices)
+        compressed_seq_len = int(compressed_key.shape[-2])
         compressed_layers.append((compressed_key, compressed_value))
         if fallback:
             fallback_layers.append(layer_idx)
@@ -516,9 +593,11 @@ def compress_past_key_values(
             {
                 "layer": layer_idx,
                 "original_seq_len": seq_len,
-                "compressed_seq_len": int(indices.numel()),
+                "compressed_seq_len": compressed_seq_len,
+                "selected_index_shape": [int(x) for x in indices.shape],
+                "per_head_selection": bool(indices.ndim == 2),
                 "target_keep_ratio": float(ratio),
-                "actual_keep_ratio": float(indices.numel() / max(seq_len, 1)),
+                "actual_keep_ratio": float(compressed_seq_len / max(seq_len, 1)),
                 "score_method": used_method,
                 "requested_score_method": config.score_method,
                 "fallback_to_key_norm": bool(fallback),

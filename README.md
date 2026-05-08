@@ -72,11 +72,17 @@ Selection methods:
   weights are unavailable, the code logs a warning and falls back to `key_norm`.
 - `snapkv`: recommended attention-based method. During prefill it reads
   attention weights, averages the last `--observation_window` query positions
-  over batch, heads, and query positions, and selects the highest-scoring middle
-  tokens for each layer. Sink tokens and recent tokens are still always kept.
+  over batch and query positions, then aggregates heads with
+  `--snapkv_head_aggregation mean|max|per_head`, and selects the
+  highest-scoring middle tokens for each layer. Sink tokens and recent tokens
+  are still always kept.
   Set `--snapkv_pooling_kernel` to an odd value such as `3` or `5` to apply
   length-preserving 1D average pooling over the token scores before top-k
   selection; the default `1` preserves the earlier no-pooling behavior.
+  The default head aggregation is `mean`; `max` keeps a token important if any
+  single attention head strongly attends to it, while still using one shared
+  token index set for all heads.  `per_head` is the closest SnapKV mode: each
+  attention head selects and gathers its own middle-token indices.
 
 SnapKV requires attention weights. The loader requests eager attention when
 possible via `attn_implementation="eager"` and retries without it on older
@@ -98,243 +104,37 @@ the default `model.generate(...)` cache-length inference.  The smoke test in
 `tests/test_pyramidsinkkv.py` also checks that compressed cache length and
 logical sequence length can differ.
 
-## Generation Benchmark
+## Running Experiments
 
-Dense baseline:
+Use `scripts.eval_ppl` for continuation perplexity, `scripts.benchmark_generation`
+for TTFT/TPOT/throughput, and `scripts.run_ablation` for grouped tables.  The
+same core flags can be swapped across scripts:
 
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode dense \
-  --score_method random \
-  --max_new_tokens 256 \
-  --output_json results/dense_generation.json
-```
+- Replace `--budget_mode` with `dense`, `no_cache`, `uniform`, `pyramid`,
+  `reversed`, `spindle`, or `hourglass`.
+- Replace `--score_method` with `random` or `snapkv`.  `key_norm` remains mainly
+  an internal fallback when attention weights are unavailable.
+- For SnapKV, compare `--snapkv_head_aggregation mean`, `max`, and `per_head`.
+  `per_head` is closest to full SnapKV because each head gathers its own indices.
+- Use `--snapkv_pooling_kernel 1` to disable pooling, or `3/5` to test local
+  score smoothing.
+- Use `--compression_ratio 0.75/0.5/0.25` for keep-ratio sweeps.
+- Use `--dataset wikitext` for cached quick runs, or `--dataset redpajama
+  --redpajama_source hub --redpajama_hub_config wikipedia` for longer text.  The
+  RedPajama loader first tries the original JSONL URL list and falls back to the
+  HuggingFace converted parquet shard if the raw stream is unstable.
+- Use `--device cuda --dtype float16` on GPU, or `--device cpu --dtype float32`
+  for reproducible CPU runs.
+- For random baselines, repeat with seeds such as `0,1,2,3,4` and report mean
+  and standard deviation.  SnapKV is deterministic for a fixed prompt/window.
 
-PyramidSinkKV:
+The main reported metrics are `ppl`, `TTFT`, `TPOT`, `throughput`,
+`total_time`, `kv_cache_memory_mb`, `achieved_compression_ratio`,
+`scoring_overhead_sec`, `snapkv_fallback_status`, and `notes`.  If an experiment
+fails, the ablation runner records the error rather than inventing a result.
 
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode pyramid \
-  --score_method random \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --max_new_tokens 256 \
-  --output_json results/pyramid_generation.json
-```
-
-Uniform SnapKV:
-
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode uniform \
-  --score_method snapkv \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --observation_window 32 \
-  --max_new_tokens 256 \
-  --output_json results/uniform_snapkv_generation.json
-```
-
-Pyramid SnapKV:
-
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode pyramid \
-  --score_method snapkv \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --observation_window 32 \
-  --max_new_tokens 256 \
-  --output_json results/pyramid_snapkv_generation.json
-```
-
-Spindle SnapKV:
-
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode spindle \
-  --score_method snapkv \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --observation_window 32 \
-  --max_new_tokens 256 \
-  --output_json results/spindle_snapkv_generation.json
-```
-
-Without `--budget_mode` and `--score_method`, the script runs a compact method
-suite focused on dense/no-cache baselines, random token selection, SnapKV
-attention-based selection, and the supported layer-wise budget modes.
-
-Reported metrics:
-
-- `TTFT`: time to first token, including prefill and optional cache compression.
-- `TPOT`: average time per output token after the first generated token.
-- `throughput`: generated tokens per second.
-- `total_time`: total generation time.
-- `scoring_overhead_sec`: extra scoring pass overhead when present. Current
-  SnapKV uses attention weights returned by prefill, so the attention-return
-  cost is included in TTFT.
-- `compression_overhead_sec`: time spent selecting indices and gathering K/V.
-- `kv_cache_memory_mb`: approximate final KV cache memory.
-- `achieved_compression_ratio`: actual compressed cache tokens divided by original cache tokens after prefill.
-- `snapkv_fallback_status`: whether SnapKV was true attention-based selection
-  or fell back to `key_norm`.
-
-Use longer generation lengths such as 256 or 512 tokens; Pythia-70M is small, so
-very short generations can hide speed differences.
-
-## Perplexity Evaluation
-
-WikiText:
-
-```bash
-python -m scripts.eval_ppl \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --dataset wikitext \
-  --split test \
-  --max_length 1024 \
-  --stride 128 \
-  --budget_mode pyramid \
-  --score_method random \
-  --compression_ratio 0.5 \
-  --output_json results/pyramid_wikitext_ppl.json
-```
-
-WikiText with spindle + SnapKV:
-
-```bash
-python -m scripts.eval_ppl \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --dataset wikitext \
-  --split test \
-  --max_length 1024 \
-  --stride 128 \
-  --budget_mode spindle \
-  --score_method snapkv \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --observation_window 32 \
-  --output_json results/spindle_snapkv_wikitext_ppl.json
-```
-
-PG-19 single-sample quick experiment:
-
-```bash
-python -m scripts.eval_ppl \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --dataset pg19 \
-  --split test \
-  --num_samples 1 \
-  --max_windows 2 \
-  --max_length 1024 \
-  --stride 128 \
-  --budget_mode pyramid \
-  --score_method random \
-  --compression_ratio 0.5 \
-  --output_json results/pyramid_pg19_ppl.json
-```
-
-For dense PPL, use `--budget_mode dense`.
-
-## Ablation Table
-
-Run the full small ablation suite:
-
-```bash
-python -m scripts.run_ablation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --compression_ratio 0.5 \
-  --max_new_tokens 256 \
-  --max_windows 2
-```
-
-Outputs:
-
-- `results/group_main_ablation.json`
-- `results/group_main_ablation.csv`
-- `results/group_main_ablation.md`
-- `results/group_ratio_sweep.json`
-- `results/group_ratio_sweep.csv`
-- `results/group_ratio_sweep.md`
-- `results/group_sink_recent_ablation.json`
-- `results/group_sink_recent_ablation.csv`
-- `results/group_sink_recent_ablation.md`
-
-SnapKV group ablation:
-
-```bash
-python -m scripts.run_ablation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --compression_ratio 0.5 \
-  --max_new_tokens 256 \
-  --dataset wikitext \
-  --split test \
-  --max_length 1024 \
-  --stride 128 \
-  --max_windows 2 \
-  --score_methods random,snapkv \
-  --budget_modes uniform,pyramid,reversed,spindle,hourglass
-```
-
-## GPU Experiment Workflow
-
-Use the `pyramidsinkkv` conda environment and confirm CUDA is visible:
-
-```bash
-conda activate pyramidsinkkv
-python - <<'PY'
-import torch
-print(torch.__version__)
-print(torch.cuda.is_available())
-print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no cuda")
-PY
-```
-
-For HuggingFace access in China, the mirror can be useful for model files:
-
-```bash
-export HF_ENDPOINT=https://hf-mirror.com
-```
-
-If a public dataset reports `Invalid username or password`, clear stale tokens:
-
-```bash
-unset HF_TOKEN
-unset HUGGING_FACE_HUB_TOKEN
-```
-
-Run the grouped WikiText ablation on GPU:
-
-```bash
-python -m scripts.run_ablation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --compression_ratio 0.5 \
-  --max_new_tokens 256 \
-  --dataset wikitext \
-  --split test \
-  --max_length 1024 \
-  --stride 128 \
-  --max_windows 2 \
-  --score_methods random,snapkv \
-  --budget_modes uniform,pyramid,reversed,spindle,hourglass \
-  --device cuda \
-  --dtype float16 \
-  --generation_repeats 5 \
-  --results_dir results/gpu_wikitext_ablation
-```
-
-Run the longer RedPajama probe on GPU without executing the legacy dataset
-script:
+Example RedPajama PPL run with spindle budget, full per-head SnapKV, pooling,
+and 25% keep ratio:
 
 ```bash
 python -m scripts.eval_ppl \
@@ -347,26 +147,23 @@ python -m scripts.eval_ppl \
   --max_length 2048 \
   --stride 256 \
   --max_windows 2 \
+  --budget_mode spindle \
+  --score_method snapkv \
   --compression_ratio 0.25 \
   --sink_size 4 \
   --recent_size 64 \
   --observation_window 32 \
-  --budget_mode spindle \
-  --score_method snapkv \
-  --seed 0 \
-  --device cuda \
-  --dtype float16 \
-  --output_json results/gpu_redpajama_spindle_025_len2048_stride256/spindle_snapkv_seed0_ppl.json
+  --snapkv_pooling_kernel 3 \
+  --snapkv_head_aggregation per_head \
+  --device cpu \
+  --dtype float32 \
+  --output_json results/redpajama_spindle_snapkv_per_head_ppl.json
 ```
 
-For the matching random baseline, repeat the RedPajama command with
-`--score_method random` and seeds such as `0,1,2,3,4`, then report mean and
-standard deviation for PPL.  CUDA timings use `torch.cuda.synchronize()` in the
-benchmark script; `eval_ppl.py` reports PPL rather than generation speed.
-
-The markdown table is intended to be copied directly into the final course
-report.  If an experiment fails, the runner records the error in the notes
-instead of inventing a result.
+For generation timing, keep the same method flags and switch the module to
+`scripts.benchmark_generation`; for grouped experiments, use
+`scripts.run_ablation` with `--score_methods random,snapkv` and the desired
+comma-separated `--budget_modes`.
 
 ## Terminal Speed Demo
 

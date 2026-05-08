@@ -68,7 +68,7 @@ EleutherAI/pythia-70m-deduped
 - `random`：可复现的随机中间 token 选择（使用 `--seed`）
 - `key_norm`：仅内部回退，选择键向量 L2 范数最大的中间 token（注意力权重不可用时使用）
 - `attention`：根据最近查询的注意力分数对历史 token 评分；若注意力权重不可用则记录警告并回退到 `key_norm`
-- `snapkv`：**推荐**的基于注意力的方法。预填充时读取注意力权重，取最后 `--observation_window` 个查询位置在 batch、头、查询位置上的平均分数，每层选择得分最高的中间 token。Sink token 和最近 token 仍被始终保留。
+- `snapkv`：**推荐**的基于注意力的方法。预填充时读取注意力权重，取最后 `--observation_window` 个查询位置，先在 batch 和查询位置上平均，再用 `--snapkv_head_aggregation mean|max|per_head` 处理不同 head 的分数，每层选择得分最高的中间 token。Sink token 和最近 token 仍被始终保留。默认 `mean` 保持原行为；`max` 表示只要某个 head 强烈关注某个 token，就把它视为重要 token，但所有 head 仍共享同一组索引；`per_head` 最接近完整 SnapKV，每个 attention head 会独立选择并 gather 自己的 token。`--snapkv_pooling_kernel 3/5` 可在 top-k 前对 token 分数做长度保持的一维平均池化。
 
 SnapKV 需要注意力权重。加载器会尽可能通过 `attn_implementation="eager"` 请求 eager attention，若遇到旧版本则重试。如果注意力权重仍然不可用，结果会记录 `score_method_fallback=true` 并使用 `key_norm`，不会静默改变行为。返回注意力权重可能增加首 token 时间；本实现优先考虑正确性和可复现性，而非融合内核的速度。
 
@@ -77,236 +77,23 @@ SnapKV 需要注意力权重。加载器会尽可能通过 `attn_implementation=
 GPTNeoX/Pythia 使用 RoPE，因此压缩后的缓存长度不能直接当作真实 token 位置。手动生成循环维护了 `logical_seq_len` 计数器。预填充后 KV 缓存可能从 1024 token 压缩到 512 token，但下一个生成 token 仍然接收 `position_ids=1024` 和 `cache_position=1024`。  
 因此脚本使用 `pyramidsinkkv.generate(...)` 而非默认的 `model.generate(...)`。`tests/test_pyramidsinkkv.py` 中的冒烟测试也检查压缩后缓存长度与逻辑序列长度是否可以不同。
 
-## 生成基准测试
+## 运行实验
 
-密集基线：
+`scripts.eval_ppl` 用于 continuation PPL，`scripts.benchmark_generation`
+用于 TTFT/TPOT/throughput，`scripts.run_ablation` 用于生成分组表格。三个入口共享大部分核心参数：
 
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode dense \
-  --score_method random \
-  --max_new_tokens 256 \
-  --output_json results/dense_generation.json
-```
+- 将 `--budget_mode` 替换为 `dense`、`no_cache`、`uniform`、`pyramid`、`reversed`、`spindle` 或 `hourglass`。
+- 将 `--score_method` 替换为 `random` 或 `snapkv`。`key_norm` 主要作为 attention 不可用时的内部 fallback。
+- SnapKV 可比较 `--snapkv_head_aggregation mean`、`max`、`per_head`。其中 `per_head` 最接近完整 SnapKV，因为每个 head 会 gather 自己的索引。
+- `--snapkv_pooling_kernel 1` 表示不做 pooling，`3/5` 用于测试局部平滑。
+- `--compression_ratio 0.75/0.5/0.25` 可用于保留比例 sweep。
+- `--dataset wikitext` 适合快速缓存实验；长文本可用 `--dataset redpajama --redpajama_source hub --redpajama_hub_config wikipedia`。RedPajama loader 会先尝试原始 JSONL URL，如果流式连接不稳定，会自动回退到 HuggingFace converted parquet 分片。
+- GPU 使用 `--device cuda --dtype float16`；CPU 复现实验可用 `--device cpu --dtype float32`。
+- random baseline 建议跑 `0,1,2,3,4` 多个 seed 并报告均值和标准差；固定窗口下 SnapKV 是确定性的。
 
-PyramidSinkKV：
+主要指标包括 `ppl`、`TTFT`、`TPOT`、`throughput`、`total_time`、`kv_cache_memory_mb`、`achieved_compression_ratio`、`scoring_overhead_sec`、`snapkv_fallback_status` 和 `notes`。如果实验失败，ablation runner 会在备注中记录错误，不会编造结果。
 
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode pyramid \
-  --score_method random \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --max_new_tokens 256 \
-  --output_json results/pyramid_generation.json
-```
-
-均匀 SnapKV：
-
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode uniform \
-  --score_method snapkv \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --observation_window 32 \
-  --max_new_tokens 256 \
-  --output_json results/uniform_snapkv_generation.json
-```
-
-金字塔 SnapKV：
-
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode pyramid \
-  --score_method snapkv \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --observation_window 32 \
-  --max_new_tokens 256 \
-  --output_json results/pyramid_snapkv_generation.json
-```
-
-纺锤形 SnapKV：
-
-```bash
-python -m scripts.benchmark_generation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --budget_mode spindle \
-  --score_method snapkv \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --observation_window 32 \
-  --max_new_tokens 256 \
-  --output_json results/spindle_snapkv_generation.json
-```
-
-如果不提供 `--budget_mode` 和 `--score_method`，脚本会运行一个精简方法集（包含密集/无缓存基线、随机选择、SnapKV 以及支持的层间预算模式）。
-
-报告指标：
-
-- `TTFT`：首 token 时间（包含预填充和可选的缓存压缩）
-- `TPOT`：首个生成 token 后每个输出 token 的平均时间
-- `throughput`：每秒生成 token 数
-- `total_time`：总生成时间
-- `scoring_overhead_sec`：额外的评分开销（当前 SnapKV 使用预填充返回的注意力权重，该成本已计入 TTFT）
-- `compression_overhead_sec`：索引选择和 K/V 收集时间
-- `kv_cache_memory_mb`：最终 KV 缓存估算内存
-- `achieved_compression_ratio`：实际压缩后 token 数 / 预填充后原始 token 数
-- `snapkv_fallback_status`：SnapKV 是否使用了真正的注意力选择，还是回退到 `key_norm`
-
-建议生成长度使用 256 或 512 token；Pythia-70M 较小，过短的生成可能会掩盖速度差异。
-
-## 困惑度评估
-
-WikiText：
-
-```bash
-python -m scripts.eval_ppl \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --dataset wikitext \
-  --split test \
-  --max_length 1024 \
-  --stride 128 \
-  --budget_mode pyramid \
-  --score_method random \
-  --compression_ratio 0.5 \
-  --output_json results/pyramid_wikitext_ppl.json
-```
-
-WikiText 使用纺锤形 + SnapKV：
-
-```bash
-python -m scripts.eval_ppl \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --dataset wikitext \
-  --split test \
-  --max_length 1024 \
-  --stride 128 \
-  --budget_mode spindle \
-  --score_method snapkv \
-  --compression_ratio 0.5 \
-  --sink_size 4 \
-  --recent_size 64 \
-  --observation_window 32 \
-  --output_json results/spindle_snapkv_wikitext_ppl.json
-```
-
-PG-19 单样本快速实验：
-
-```bash
-python -m scripts.eval_ppl \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --dataset pg19 \
-  --split test \
-  --num_samples 1 \
-  --max_windows 2 \
-  --max_length 1024 \
-  --stride 128 \
-  --budget_mode pyramid \
-  --score_method random \
-  --compression_ratio 0.5 \
-  --output_json results/pyramid_pg19_ppl.json
-```
-
-对于密集模型困惑度，使用 `--budget_mode dense`。
-
-## 消融表格
-
-运行完整的小型消融套件：
-
-```bash
-python -m scripts.run_ablation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --compression_ratio 0.5 \
-  --max_new_tokens 256 \
-  --max_windows 2
-```
-
-输出文件：
-
-- `results/group_main_ablation.json`
-- `results/group_main_ablation.csv`
-- `results/group_main_ablation.md`
-- `results/group_ratio_sweep.json`
-- `results/group_ratio_sweep.csv`
-- `results/group_ratio_sweep.md`
-- `results/group_sink_recent_ablation.json`
-- `results/group_sink_recent_ablation.csv`
-- `results/group_sink_recent_ablation.md`
-
-SnapKV 分组消融：
-
-```bash
-python -m scripts.run_ablation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --compression_ratio 0.5 \
-  --max_new_tokens 256 \
-  --dataset wikitext \
-  --split test \
-  --max_length 1024 \
-  --stride 128 \
-  --max_windows 2 \
-  --score_methods random,snapkv \
-  --budget_modes uniform,pyramid,reversed,spindle,hourglass
-```
-
-## GPU 实验流程
-
-使用 `pyramidsinkkv` conda 环境并确认 CUDA 可见：
-
-```bash
-conda activate pyramidsinkkv
-python - <<'PY'
-import torch
-print(torch.__version__)
-print(torch.cuda.is_available())
-print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no cuda")
-PY
-```
-
-在中国访问 HuggingFace 时，镜像可用于获取模型文件：
-
-```bash
-export HF_ENDPOINT=https://hf-mirror.com
-```
-
-如果公共数据集报告 `Invalid username or password`，请清理过期的 token：
-
-```bash
-unset HF_TOKEN
-unset HUGGING_FACE_HUB_TOKEN
-```
-
-在 GPU 上运行分组的 WikiText 消融实验：
-
-```bash
-python -m scripts.run_ablation \
-  --model_name_or_path EleutherAI/pythia-70m \
-  --compression_ratio 0.5 \
-  --max_new_tokens 256 \
-  --dataset wikitext \
-  --split test \
-  --max_length 1024 \
-  --stride 128 \
-  --max_windows 2 \
-  --score_methods random,snapkv \
-  --budget_modes uniform,pyramid,reversed,spindle,hourglass \
-  --device cuda \
-  --dtype float16 \
-  --generation_repeats 5 \
-  --results_dir results/gpu_wikitext_ablation
-```
-
-在 GPU 上运行更长的 RedPajama 探测实验（不执行旧的数据集脚本）：
+下面是一个 RedPajama PPL 示例：使用 spindle 预算、完整 per-head SnapKV、pooling 和 25% 保留比例。
 
 ```bash
 python -m scripts.eval_ppl \
@@ -319,21 +106,20 @@ python -m scripts.eval_ppl \
   --max_length 2048 \
   --stride 256 \
   --max_windows 2 \
+  --budget_mode spindle \
+  --score_method snapkv \
   --compression_ratio 0.25 \
   --sink_size 4 \
   --recent_size 64 \
   --observation_window 32 \
-  --budget_mode spindle \
-  --score_method snapkv \
-  --seed 0 \
-  --device cuda \
-  --dtype float16 \
-  --output_json results/gpu_redpajama_spindle_025_len2048_stride256/spindle_snapkv_seed0_ppl.json
+  --snapkv_pooling_kernel 3 \
+  --snapkv_head_aggregation per_head \
+  --device cpu \
+  --dtype float32 \
+  --output_json results/redpajama_spindle_snapkv_per_head_ppl.json
 ```
 
-对于对应的随机基线，使用 `--score_method random` 和种子（如 `0,1,2,3,4`）重复上述 RedPajama 命令，然后报告困惑度的均值和标准差。CUDA 计时在基准测试脚本中使用 `torch.cuda.synchronize()`；`eval_ppl.py` 报告困惑度而非生成速度。
-
-生成的 Markdown 表格可直接复制到最终课程报告中。若某个实验失败，运行器会在备注中记录错误，不会编造结果。
+如果要测生成速度，保留同样的方法参数并把入口换成 `scripts.benchmark_generation`；如果要跑分组实验，使用 `scripts.run_ablation` 并设置 `--score_methods random,snapkv` 和需要的逗号分隔 `--budget_modes`。
 
 ## 终端速度演示
 
