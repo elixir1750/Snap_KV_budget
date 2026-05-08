@@ -64,9 +64,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--snapkv_head_aggregation",
-        choices=["mean", "max"],
+        choices=["mean", "max", "per_head"],
         default="mean",
-        help="How to aggregate per-head SnapKV scores before 1D token selection.",
+        help="How to use per-head SnapKV scores: mean/max share one index set; per_head gathers distinct indices per head.",
     )
     parser.add_argument(
         "--budget_mode",
@@ -147,22 +147,72 @@ def load_redpajama_hub_texts(
         raise RuntimeError(f"No data URLs found in {urls_list}")
 
     texts = []
+    seen_texts = set()
     errors = []
     for data_url in data_urls:
-        try:
-            for row in _iter_jsonl_url(data_url):
-                text = row.get("text", "")
-                if text and text.strip():
-                    texts.append(text)
-                if len(texts) >= max(1, num_samples):
-                    return ["\n\n".join(texts)]
-        except Exception as exc:  # pragma: no cover - depends on remote data availability.
-            errors.append(f"{data_url}: {exc}")
-            continue
+        for attempt in range(1, 6):
+            try:
+                for row in _iter_jsonl_url(data_url):
+                    text = row.get("text", "")
+                    if text and text.strip() and text not in seen_texts:
+                        texts.append(text)
+                        seen_texts.add(text)
+                    if len(texts) >= max(1, num_samples):
+                        return ["\n\n".join(texts)]
+            except Exception as exc:  # pragma: no cover - depends on remote data availability.
+                errors.append(f"{data_url} attempt {attempt}/5: {exc}")
+                if attempt < 5:
+                    wait_sec = min(2 * attempt, 10)
+                    print(f"[redpajama] stream failed on attempt {attempt}/5; retrying in {wait_sec}s: {exc}")
+                    time.sleep(wait_sec)
+                    continue
+            break
     raise RuntimeError(
         f"No text rows were loaded from RedPajama subset={subset}. "
         f"Recent URL errors: {' | '.join(errors[-3:])}"
     )
+
+
+def load_redpajama_parquet_texts(
+    dataset_id: str,
+    subset: str,
+    num_samples: int,
+):
+    """Load RedPajama rows from HuggingFace's converted parquet branch.
+
+    This avoids the raw ``data.together.xyz`` JSONL host, which can terminate
+    long TLS streams in some networks.  The parquet files live on the Hub under
+    ``refs/convert/parquet`` and can be streamed by ``datasets`` directly.
+    """
+
+    from datasets import load_dataset
+
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    subset = subset or "wikipedia"
+    parquet_url = (
+        f"{endpoint}/datasets/{dataset_id}/resolve/refs%2Fconvert%2Fparquet/"
+        f"{subset}/partial-train/0000.parquet"
+    )
+    try:
+        dataset = load_dataset("parquet", data_files=parquet_url, split="train", streaming=True)
+    except Exception:
+        if endpoint == "https://huggingface.co":
+            raise
+        parquet_url = (
+            f"https://huggingface.co/datasets/{dataset_id}/resolve/refs%2Fconvert%2Fparquet/"
+            f"{subset}/partial-train/0000.parquet"
+        )
+        print(f"[redpajama] failed to load parquet from {endpoint}; retrying with huggingface.co.")
+        dataset = load_dataset("parquet", data_files=parquet_url, split="train", streaming=True)
+
+    texts = []
+    for row in dataset:
+        text = row.get("text", "")
+        if text and text.strip():
+            texts.append(text)
+        if len(texts) >= max(1, num_samples):
+            return ["\n\n".join(texts)]
+    raise RuntimeError(f"No text rows were loaded from RedPajama parquet file: {parquet_url}")
 
 
 def load_texts(
@@ -192,7 +242,11 @@ def load_texts(
         if redpajama_source == "hub":
             if split != "train":
                 print("[redpajama] full RedPajama URL lists are train-only; ignoring --split and streaming train rows.")
-            return load_redpajama_hub_texts(redpajama_hub_dataset, redpajama_hub_config, num_samples)
+            try:
+                return load_redpajama_hub_texts(redpajama_hub_dataset, redpajama_hub_config, num_samples)
+            except RuntimeError as exc:
+                print(f"[redpajama] raw JSONL stream failed; falling back to converted parquet: {exc}")
+                return load_redpajama_parquet_texts(redpajama_hub_dataset, redpajama_hub_config, num_samples)
 
         data_file = redpajama_file
         if not Path(data_file).exists() and "://" not in data_file:

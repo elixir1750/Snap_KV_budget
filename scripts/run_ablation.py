@@ -39,7 +39,7 @@ def build_arg_parser():
     parser.add_argument("--stride", type=int, default=128)
     parser.add_argument("--observation_window", type=int, default=32)
     parser.add_argument("--snapkv_pooling_kernel", type=int, default=1)
-    parser.add_argument("--snapkv_head_aggregation", choices=["mean", "max"], default="mean")
+    parser.add_argument("--snapkv_head_aggregation", choices=["mean", "max", "per_head"], default="mean")
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--max_windows", type=int, default=2)
     parser.add_argument("--results_dir", default="results")

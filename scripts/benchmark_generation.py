@@ -34,9 +34,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--snapkv_head_aggregation",
-        choices=["mean", "max"],
+        choices=["mean", "max", "per_head"],
         default="mean",
-        help="How to aggregate per-head SnapKV scores before 1D token selection.",
+        help="How to use per-head SnapKV scores: mean/max share one index set; per_head gathers distinct indices per head.",
     )
     parser.add_argument(
         "--budget_mode",

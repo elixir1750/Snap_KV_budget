@@ -145,6 +145,86 @@ def test_snapkv_head_aggregation_max_keeps_head_specific_signal():
     assert max_scores.argmax().item() == 2
 
 
+def test_snapkv_per_head_scores_keep_head_dimension():
+    attention = torch.zeros(1, 2, 4, 8)
+    attention[:, 0, -2:, 2] = 9.0
+    attention[:, 1, -2:, 6] = 7.0
+
+    scores = _snapkv_attention_scores(
+        attention,
+        seq_len=8,
+        observation_window=2,
+        pooling_kernel=1,
+        head_aggregation="per_head",
+    )
+
+    assert scores is not None
+    assert scores.shape == (2, 8)
+    assert scores[0].argmax().item() == 2
+    assert scores[1].argmax().item() == 6
+
+
+def test_snapkv_per_head_selection_and_gather_use_distinct_indices():
+    key = torch.arange(1 * 2 * 16 * 4, dtype=torch.float32).view(1, 2, 16, 4)
+    value = key + 1000
+    attention = torch.zeros(1, 2, 16, 16)
+    attention[:, 0, -4:, 5] = 10.0
+    attention[:, 1, -4:, 9] = 10.0
+    config = PyramidSinkKVConfig(
+        compression_ratio=0.5,
+        sink_size=2,
+        recent_size=3,
+        budget_mode="uniform",
+        score_method="snapkv",
+        observation_window=4,
+        snapkv_head_aggregation="per_head",
+    )
+
+    indices, used_method, fallback = select_token_indices(key, 8, config, layer_idx=0, attention=attention)
+    compressed_key, compressed_value = gather_kv_by_indices(key, value, indices)
+
+    assert used_method == "snapkv"
+    assert fallback is False
+    assert indices.shape == (2, 8)
+    assert {0, 1}.issubset(set(indices[0].tolist()))
+    assert {13, 14, 15}.issubset(set(indices[1].tolist()))
+    assert 5 in set(indices[0].tolist())
+    assert 9 in set(indices[1].tolist())
+    assert compressed_key.shape == (1, 2, 8, 4)
+    assert compressed_value.shape == (1, 2, 8, 4)
+    head0_pos = indices[0].tolist().index(5)
+    head1_pos = indices[1].tolist().index(9)
+    assert torch.equal(compressed_key[0, 0, head0_pos], key[0, 0, 5])
+    assert torch.equal(compressed_key[0, 1, head1_pos], key[0, 1, 9])
+    assert torch.equal(compressed_value[0, 0, head0_pos], value[0, 0, 5])
+    assert torch.equal(compressed_value[0, 1, head1_pos], value[0, 1, 9])
+
+
+def test_per_head_compression_stats_use_keep_length_not_numel():
+    key = torch.randn(1, 2, 16, 4)
+    value = torch.randn(1, 2, 16, 4)
+    attention = torch.zeros(1, 2, 16, 16)
+    attention[:, 0, -4:, 5] = 10.0
+    attention[:, 1, -4:, 9] = 10.0
+    config = PyramidSinkKVConfig(
+        compression_ratio=0.5,
+        sink_size=2,
+        recent_size=3,
+        budget_mode="uniform",
+        score_method="snapkv",
+        observation_window=4,
+        snapkv_head_aggregation="per_head",
+    )
+
+    compressed, stats = compress_past_key_values(((key, value),), config, attentions=[attention])
+
+    assert compressed[0][0].shape == (1, 2, 8, 4)
+    assert stats["per_layer"][0]["compressed_seq_len"] == 8
+    assert stats["per_layer"][0]["selected_index_shape"] == [2, 8]
+    assert stats["per_layer"][0]["per_head_selection"] is True
+    assert stats["achieved_compression_ratio"] == 0.5
+
+
 def test_snapkv_fallback_to_key_norm_is_recorded_when_attentions_unavailable():
     layers = []
     for _ in range(2):
@@ -175,4 +255,7 @@ if __name__ == "__main__":
     test_snapkv_score_shape_is_seq_len()
     test_snapkv_pooling_spreads_local_importance()
     test_snapkv_head_aggregation_max_keeps_head_specific_signal()
+    test_snapkv_per_head_scores_keep_head_dimension()
+    test_snapkv_per_head_selection_and_gather_use_distinct_indices()
+    test_per_head_compression_stats_use_keep_length_not_numel()
     test_snapkv_fallback_to_key_norm_is_recorded_when_attentions_unavailable()

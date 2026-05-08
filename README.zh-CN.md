@@ -68,7 +68,7 @@ EleutherAI/pythia-70m-deduped
 - `random`：可复现的随机中间 token 选择（使用 `--seed`）
 - `key_norm`：仅内部回退，选择键向量 L2 范数最大的中间 token（注意力权重不可用时使用）
 - `attention`：根据最近查询的注意力分数对历史 token 评分；若注意力权重不可用则记录警告并回退到 `key_norm`
-- `snapkv`：**推荐**的基于注意力的方法。预填充时读取注意力权重，取最后 `--observation_window` 个查询位置，先在 batch 和查询位置上平均，再用 `--snapkv_head_aggregation mean|max` 聚合不同 head 的分数，每层选择得分最高的中间 token。Sink token 和最近 token 仍被始终保留。默认 `mean` 保持原行为；`max` 表示只要某个 head 强烈关注某个 token，就把它视为重要 token。`--snapkv_pooling_kernel 3/5` 可在 top-k 前对 token 分数做长度保持的一维平均池化。
+- `snapkv`：**推荐**的基于注意力的方法。预填充时读取注意力权重，取最后 `--observation_window` 个查询位置，先在 batch 和查询位置上平均，再用 `--snapkv_head_aggregation mean|max|per_head` 处理不同 head 的分数，每层选择得分最高的中间 token。Sink token 和最近 token 仍被始终保留。默认 `mean` 保持原行为；`max` 表示只要某个 head 强烈关注某个 token，就把它视为重要 token，但所有 head 仍共享同一组索引；`per_head` 最接近完整 SnapKV，每个 attention head 会独立选择并 gather 自己的 token。`--snapkv_pooling_kernel 3/5` 可在 top-k 前对 token 分数做长度保持的一维平均池化。
 
 SnapKV 需要注意力权重。加载器会尽可能通过 `attn_implementation="eager"` 请求 eager attention，若遇到旧版本则重试。如果注意力权重仍然不可用，结果会记录 `score_method_fallback=true` 并使用 `key_norm`，不会静默改变行为。返回注意力权重可能增加首 token 时间；本实现优先考虑正确性和可复现性，而非融合内核的速度。
 
