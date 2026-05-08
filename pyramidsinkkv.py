@@ -45,6 +45,7 @@ class PyramidSinkKVConfig:
     score_method: str = "key_norm"
     observation_window: int = 32
     snapkv_pooling_kernel: int = 1
+    snapkv_head_aggregation: str = "mean"
     seed: int = 0
     safe_min_length: int = 8
     debug_selection: bool = False
@@ -254,12 +255,14 @@ def _snapkv_attention_scores(
     seq_len: int,
     observation_window: int,
     pooling_kernel: int = 1,
+    head_aggregation: str = "mean",
 ) -> Optional[torch.Tensor]:
     """Compute SnapKV-style scores from recent queries to all prompt keys.
 
     HF GPTNeoX attentions are normally ``[batch, heads, query_len, key_len]``.
     We explicitly validate this shape and average the last observation-window
-    query rows over batch, heads, and query positions, yielding ``[seq_len]``.
+    query rows over batch and query positions.  Head scores are then aggregated
+    with ``mean`` or ``max``, yielding ``[seq_len]``.
     When ``pooling_kernel`` is greater than one, apply a length-preserving 1D
     average pooling pass over the sequence dimension.  This keeps the current
     head-agnostic cache format while adding SnapKV's local continuity bias.
@@ -274,7 +277,16 @@ def _snapkv_attention_scores(
     window = min(max(int(observation_window), 1), int(attention.shape[-2]))
     key_start = int(attention.shape[-1]) - seq_len
     recent_attn = attention[:, :, -window:, key_start:]
-    score = recent_attn.float().mean(dim=(0, 1, 2))
+    per_head_score = recent_attn.float().mean(dim=(0, 2))
+    if per_head_score.ndim != 2 or int(per_head_score.shape[-1]) != seq_len:
+        return None
+    aggregation = str(head_aggregation).lower()
+    if aggregation == "mean":
+        score = per_head_score.mean(dim=0)
+    elif aggregation == "max":
+        score = per_head_score.max(dim=0).values
+    else:
+        raise ValueError(f"Unsupported snapkv_head_aggregation: {head_aggregation}")
     if score.ndim != 1 or int(score.shape[0]) != seq_len:
         return None
     kernel = int(pooling_kernel)
@@ -282,7 +294,8 @@ def _snapkv_attention_scores(
         kernel = min(kernel, int(score.numel()))
         pad_left = (kernel - 1) // 2
         pad_right = kernel // 2
-        pooled = F.avg_pool1d(F.pad(score.view(1, 1, -1), (pad_left, pad_right), mode="replicate"), kernel_size=kernel, stride=1)
+        padded = F.pad(score.view(1, 1, -1), (pad_left, pad_right), mode="replicate")
+        pooled = F.avg_pool1d(padded, kernel_size=kernel, stride=1)
         score = pooled.view(-1)
         if score.ndim != 1 or int(score.shape[0]) != seq_len:
             return None
@@ -324,6 +337,7 @@ def _select_middle_by_method(
             seq_len,
             config.observation_window,
             config.snapkv_pooling_kernel,
+            config.snapkv_head_aggregation,
         )
         if scores is None:
             LOGGER.warning(

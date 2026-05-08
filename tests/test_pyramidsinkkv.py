@@ -121,6 +121,30 @@ def test_snapkv_pooling_spreads_local_importance():
     assert pooled_scores[5].item() > 0.0
 
 
+def test_snapkv_head_aggregation_max_keeps_head_specific_signal():
+    attention = torch.zeros(1, 2, 4, 8)
+    attention[:, 0, -2:, 2] = 9.0
+    attention[:, :, -2:, 6] = 5.0
+
+    mean_scores = _snapkv_attention_scores(
+        attention,
+        seq_len=8,
+        observation_window=2,
+        head_aggregation="mean",
+    )
+    max_scores = _snapkv_attention_scores(
+        attention,
+        seq_len=8,
+        observation_window=2,
+        head_aggregation="max",
+    )
+
+    assert mean_scores is not None
+    assert max_scores is not None
+    assert mean_scores.argmax().item() == 6
+    assert max_scores.argmax().item() == 2
+
+
 def test_snapkv_fallback_to_key_norm_is_recorded_when_attentions_unavailable():
     layers = []
     for _ in range(2):
@@ -150,4 +174,5 @@ if __name__ == "__main__":
     test_gather_kv_length_matches_selected_indices()
     test_snapkv_score_shape_is_seq_len()
     test_snapkv_pooling_spreads_local_importance()
+    test_snapkv_head_aggregation_max_keeps_head_specific_signal()
     test_snapkv_fallback_to_key_norm_is_recorded_when_attentions_unavailable()

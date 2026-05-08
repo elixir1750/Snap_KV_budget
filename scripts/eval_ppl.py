@@ -63,6 +63,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Length-preserving 1D average-pooling kernel for SnapKV scores; 1 disables pooling.",
     )
     parser.add_argument(
+        "--snapkv_head_aggregation",
+        choices=["mean", "max"],
+        default="mean",
+        help="How to aggregate per-head SnapKV scores before 1D token selection.",
+    )
+    parser.add_argument(
         "--budget_mode",
         choices=["no_cache", "dense", "uniform", "pyramid", "reversed", "spindle", "hourglass"],
         default="dense",
@@ -358,6 +364,7 @@ def main():
         recent_size=args.recent_size,
         observation_window=args.observation_window,
         snapkv_pooling_kernel=args.snapkv_pooling_kernel,
+        snapkv_head_aggregation=args.snapkv_head_aggregation,
         budget_mode=budget_mode,
         score_method=args.score_method,
         seed=args.seed,
@@ -415,6 +422,7 @@ def main():
         "score_method": args.score_method,
         "observation_window": args.observation_window,
         "snapkv_pooling_kernel": args.snapkv_pooling_kernel,
+        "snapkv_head_aggregation": args.snapkv_head_aggregation,
         "sink_size": args.sink_size,
         "recent_size": args.recent_size,
         "compression_ratio": 1.0 if dense or no_cache else args.compression_ratio,

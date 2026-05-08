@@ -24,10 +24,11 @@ KV 压缩可以拆成两个相对独立的问题：
 
 ```text
 recent_attn = attentions[layer][:, :, -observation_window:, :]
-score = recent_attn.mean(dim=(0, 1, 2))
+per_head_score = recent_attn.mean(dim=(0, 2))
+score = per_head_score.mean(dim=0)  # 或 max(dim=0)
 ```
 
-得到形状为 `[seq_len]` 的分数后，可以通过 `--snapkv_pooling_kernel` 对序列维度做长度保持的一维平均池化；默认值 `1` 表示不做 pooling，`3` 或 `5` 可用于测试局部连续性假设。随后只在中间区域做 top-k，最后将 sink、SnapKV middle、recent 合并去重并按原始位置排序，以保证压缩后的 K/V 仍保持原始 token 顺序。
+当前代码进一步支持 `--snapkv_head_aggregation mean|max`。`mean` 是原始简化实现，会把所有 head 平均成一个 `[seq_len]` 分数；`max` 则先得到每个 head 的 token 分数，再对 head 维取最大值，用来测试“某个 head 独有的重要 token 是否被均值稀释”的假设。得到形状为 `[seq_len]` 的分数后，可以通过 `--snapkv_pooling_kernel` 对序列维度做长度保持的一维平均池化；默认值 `1` 表示不做 pooling，`3` 或 `5` 可用于测试局部连续性假设。随后只在中间区域做 top-k，最后将 sink、SnapKV middle、recent 合并去重并按原始位置排序，以保证压缩后的 K/V 仍保持原始 token 顺序。
 
 ## Layer-wise Budget 的作用
 
