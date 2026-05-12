@@ -7,6 +7,7 @@ set -u
 # - dataset: RedPajama full repo, wikipedia subset
 # - compression_ratio: 0.5
 # - sink/recent/observation_window: 4 / 64 / 32
+# - baseline: dense full KV cache
 # - budget modes: uniform, pyramid, reversed, spindle, hourglass
 # - score methods: random and snapkv
 #
@@ -14,6 +15,7 @@ set -u
 #   DEVICE=cuda DTYPE=float16 bash scripts/run_redpajama_budget_grid.sh
 #   SNAPKV_HEAD_AGGREGATION=mean bash scripts/run_redpajama_budget_grid.sh
 #   MAX_WINDOWS=1 NUM_SAMPLES=2 bash scripts/run_redpajama_budget_grid.sh
+#   INCLUDE_DENSE_BASELINE=0 bash scripts/run_redpajama_budget_grid.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/miniconda3/envs/pyramidsinkkv/bin/python}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-EleutherAI/pythia-70m}"
@@ -39,12 +41,14 @@ DEVICE="${DEVICE:-cpu}"
 DTYPE="${DTYPE:-float32}"
 RANDOM_SEEDS="${RANDOM_SEEDS:-0 1 2 3 4}"
 BUDGET_MODES="${BUDGET_MODES:-uniform pyramid reversed spindle hourglass}"
+INCLUDE_DENSE_BASELINE="${INCLUDE_DENSE_BASELINE:-1}"
 
 mkdir -p "${RESULTS_DIR}"
 
 echo "[grid] results_dir=${RESULTS_DIR}"
 echo "[grid] budget_modes=${BUDGET_MODES}"
 echo "[grid] random_seeds=${RANDOM_SEEDS}"
+echo "[grid] include_dense_baseline=${INCLUDE_DENSE_BASELINE}"
 echo "[grid] snapkv_head_aggregation=${SNAPKV_HEAD_AGGREGATION}"
 echo "[grid] device=${DEVICE} dtype=${DTYPE}"
 
@@ -84,6 +88,14 @@ run_eval() {
     --output_json "${output_json}"
 }
 
+if [[ "${INCLUDE_DENSE_BASELINE}" != "0" ]]; then
+  run_eval \
+    "dense" \
+    "key_norm" \
+    "0" \
+    "${RESULTS_DIR}/dense_full_cache_seed0_ppl.json" || true
+fi
+
 for budget_mode in ${BUDGET_MODES}; do
   for seed in ${RANDOM_SEEDS}; do
     run_eval \
@@ -112,6 +124,8 @@ budgets = ["uniform", "pyramid", "reversed", "spindle", "hourglass"]
 rows = []
 
 def achieved_ratio(data):
+    if data.get("budget_mode") == "dense":
+        return 1.0
     compression = data.get("compression") or []
     if compression and compression[0].get("achieved_compression_ratio") is not None:
         return float(compression[0]["achieved_compression_ratio"])
@@ -168,6 +182,31 @@ for budget in budgets:
                 "snapkv_fallback_status": "unknown",
                 "notes": f"{path.name}: {exc}",
             })
+
+for path in sorted(root.glob("dense_full_cache*_ppl.json")):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        rows.append({
+            "budget_mode": "dense",
+            "score_method": "full_cache",
+            "runs": 1,
+            "ppl": f"{float(data['ppl']):.4f}",
+            "ppl_mean": float(data["ppl"]),
+            "achieved_compression_ratio": "1.0000",
+            "snapkv_fallback_status": "not_applicable",
+            "notes": "full KV cache baseline; not memory-matched to compressed runs",
+        })
+    except Exception as exc:
+        rows.append({
+            "budget_mode": "dense",
+            "score_method": "full_cache",
+            "runs": 0,
+            "ppl": "FAILED",
+            "ppl_mean": float("inf"),
+            "achieved_compression_ratio": "1.0000",
+            "snapkv_fallback_status": "not_applicable",
+            "notes": f"{path.name}: {exc}",
+        })
 
 rows.sort(key=lambda item: (item["ppl_mean"], item["budget_mode"], item["score_method"]))
 
