@@ -17,8 +17,8 @@ set -u
 #   SNAPKV_POOLING_KERNEL=3 bash scripts/run_redpajama_arxiv_length_ablation.sh
 #
 # Useful overrides:
-#   DEVICE=cuda DTYPE=float16 bash scripts/run_redpajama_arxiv_length_ablation.sh
-#   LENGTHS="2048 4096" MAX_WINDOWS=1 bash scripts/run_redpajama_arxiv_length_ablation.sh
+#   DEVICE=cpu DTYPE=float32 NUM_SAMPLES=2 MAX_WINDOWS=1 bash scripts/run_redpajama_arxiv_length_ablation.sh
+#   LENGTHS="512 1024" MAX_WINDOWS=1 bash scripts/run_redpajama_arxiv_length_ablation.sh
 #   RANDOM_SEEDS="0" NUM_SAMPLES=2 bash scripts/run_redpajama_arxiv_length_ablation.sh
 
 PYTHON_BIN="${PYTHON_BIN:-/opt/miniconda3/envs/pyramidsinkkv/bin/python}"
@@ -29,10 +29,10 @@ DATASET="${DATASET:-redpajama}"
 REDPAJAMA_SOURCE="${REDPAJAMA_SOURCE:-hub}"
 REDPAJAMA_HUB_CONFIG="${REDPAJAMA_HUB_CONFIG:-arxiv}"
 SPLIT="${SPLIT:-train}"
-NUM_SAMPLES="${NUM_SAMPLES:-8}"
-LENGTHS="${LENGTHS:-2048 4096 6144 8192}"
+NUM_SAMPLES="${NUM_SAMPLES:-16}"
+LENGTHS="${LENGTHS:-512 1024 1536 2048}"
 STRIDE="${STRIDE:-256}"
-MAX_WINDOWS="${MAX_WINDOWS:-2}"
+MAX_WINDOWS="${MAX_WINDOWS:-8}"
 
 COMPRESSION_RATIO="${COMPRESSION_RATIO:-0.25}"
 SINK_SIZE="${SINK_SIZE:-4}"
@@ -40,8 +40,8 @@ RECENT_SIZE="${RECENT_SIZE:-64}"
 OBSERVATION_WINDOW="${OBSERVATION_WINDOW:-32}"
 SNAPKV_POOLING_KERNEL="${SNAPKV_POOLING_KERNEL:-7}"
 
-DEVICE="${DEVICE:-cpu}"
-DTYPE="${DTYPE:-float32}"
+DEVICE="${DEVICE:-cuda}"
+DTYPE="${DTYPE:-float16}"
 RANDOM_SEEDS="${RANDOM_SEEDS:-0 1 2 3 4}"
 
 mkdir -p "${RESULTS_DIR}"
