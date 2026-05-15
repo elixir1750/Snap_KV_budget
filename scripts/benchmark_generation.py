@@ -2,6 +2,8 @@ import argparse
 import json
 from pathlib import Path
 
+import torch
+
 from pyramidsinkkv import (
     PyramidSinkKVConfig,
     generate,
@@ -21,6 +23,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Benchmark dense and PyramidSinkKV generation for Pythia/GPTNeoX.")
     parser.add_argument("--model_name_or_path", default="EleutherAI/pythia-70m")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument("--prompt_file", default=None, help="Optional text file used as the generation prompt.")
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--compression_ratio", type=float, default=0.5)
     parser.add_argument("--sink_size", type=int, default=4)
@@ -51,6 +54,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup_runs", type=int, default=1)
     parser.add_argument("--debug_selection", action="store_true")
     return parser
+
+
+def load_prompt(args) -> str:
+    if args.prompt_file:
+        return Path(args.prompt_file).read_text(encoding="utf-8")
+    return args.prompt
+
+
+def add_timing_memory_metrics(item, device):
+    tpot = float(item.get("tpot", 0.0) or 0.0)
+    total_time = float(item.get("total_time", 0.0) or 0.0)
+    generated_tokens = int(item.get("generated_tokens", 0) or 0)
+    prompt_tokens = int(item.get("prompt_tokens", 0) or 0)
+    item["decode_tokens_per_sec"] = (1.0 / tpot) if tpot > 0 else None
+    item["total_tokens_per_sec"] = ((prompt_tokens + generated_tokens) / total_time) if total_time > 0 else None
+    item["estimated_kv_cache_memory_mb"] = item.get("kv_cache_memory_mb")
+    if device.type == "cuda":
+        item["peak_cuda_memory_allocated_mb"] = torch.cuda.max_memory_allocated(device) / (1024**2)
+    else:
+        item["peak_cuda_memory_allocated_mb"] = None
+    return item
 
 
 def default_methods(args):
@@ -216,6 +240,7 @@ def default_methods(args):
 
 def main():
     args = build_arg_parser().parse_args()
+    prompt = load_prompt(args)
     requested_attn = args.score_method in ("attention", "snapkv")
     model, tokenizer, device = load_model_and_tokenizer(
         args.model_name_or_path,
@@ -248,20 +273,26 @@ def main():
         methods = default_methods(args)
 
     for _ in range(max(0, args.warmup_runs)):
-        generate(model, tokenizer, args.prompt, min(args.max_new_tokens, 8), methods[0][1], device)
+        generate(model, tokenizer, prompt, min(args.max_new_tokens, 8), methods[0][1], device)
 
     results = []
     for method_name, config in methods:
         print(f"[benchmark] running {method_name}")
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
         if config.budget_mode == "no_cache":
-            item = generate_no_cache(model, tokenizer, args.prompt, args.max_new_tokens, device)
+            item = generate_no_cache(model, tokenizer, prompt, args.max_new_tokens, device)
         else:
-            item = generate(model, tokenizer, args.prompt, args.max_new_tokens, config, device)
+            item = generate(model, tokenizer, prompt, args.max_new_tokens, config, device)
         item["method"] = method_name
+        add_timing_memory_metrics(item, device)
         results.append(item)
         print(
             f"  TTFT={item['ttft']:.4f}s TPOT={item['tpot']:.4f}s "
-            f"throughput={item['throughput']:.2f} tok/s KV={item['kv_cache_memory_mb']:.2f} MB "
+            f"decode={item['decode_tokens_per_sec'] or 0.0:.2f} tok/s "
+            f"total={item['total_tokens_per_sec'] or 0.0:.2f} tok/s "
+            f"KV={item['estimated_kv_cache_memory_mb']:.2f} MB "
             f"scoring_overhead={item.get('compression', {}).get('scoring_overhead_sec', 0.0):.4f}s "
             f"compression_overhead={item.get('compression', {}).get('compression_overhead_sec', 0.0):.4f}s"
         )
@@ -272,7 +303,8 @@ def main():
         "observation_window": args.observation_window,
         "snapkv_pooling_kernel": args.snapkv_pooling_kernel,
         "snapkv_head_aggregation": args.snapkv_head_aggregation,
-        "prompt": args.prompt,
+        "prompt": prompt,
+        "prompt_file": args.prompt_file,
         "results": results,
     }
     if args.output_json:
