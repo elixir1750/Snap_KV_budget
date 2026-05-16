@@ -241,12 +241,11 @@ def default_methods(args):
 def main():
     args = build_arg_parser().parse_args()
     prompt = load_prompt(args)
-    requested_attn = args.score_method in ("attention", "snapkv")
     model, tokenizer, device = load_model_and_tokenizer(
         args.model_name_or_path,
         device=args.device,
         dtype=args.dtype,
-        attn_implementation="eager" if requested_attn else None,
+        attn_implementation=None,
     )
 
     if args.budget_mode is not None or args.score_method is not None:

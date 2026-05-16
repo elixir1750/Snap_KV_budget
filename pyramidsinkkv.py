@@ -622,6 +622,68 @@ def compress_past_key_values(
     return compressed_cache, stats
 
 
+def snapkv_scoring_attentions(
+    model: Any,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    past_key_values: Any,
+    logical_seq_len: int,
+    observation_window: int,
+    device: torch.device,
+) -> Sequence[Optional[torch.Tensor]]:
+    """Return SnapKV attentions without materializing full prefill attention.
+
+    Calling the full prompt forward with ``output_attentions=True`` forces eager
+    attention and returns ``[batch, heads, seq, seq]`` tensors for every layer.
+    For long prompts that destroys both TTFT and peak memory.  SnapKV only needs
+    the last few query rows, so run the real prefill with SDPA/no attentions,
+    then run a short scoring pass over the last observation-window tokens while
+    attending to the already-built prompt KV cache.  The extra pass is
+    ``O(observation_window * seq_len)`` instead of ``O(seq_len^2)``.
+    """
+
+    window = min(max(int(observation_window), 1), int(logical_seq_len))
+    query_ids = input_ids[:, logical_seq_len - window : logical_seq_len]
+    # Include the duplicate scoring queries in the mask because HF will append
+    # them to the provided cache for this throwaway forward pass.  Scores below
+    # later slice back to the original prompt keys.
+    scoring_mask = torch.ones(
+        (input_ids.shape[0], int(logical_seq_len) + window),
+        dtype=attention_mask.dtype,
+        device=device,
+    )
+    position_ids = torch.arange(
+        logical_seq_len - window,
+        logical_seq_len,
+        dtype=torch.long,
+        device=device,
+    ).view(1, -1)
+    cache_position = torch.arange(
+        logical_seq_len,
+        logical_seq_len + window,
+        dtype=torch.long,
+        device=device,
+    )
+    scoring_cache = _legacy_to_cache(_cache_to_legacy(past_key_values), past_key_values)
+    outputs = model(
+        input_ids=query_ids,
+        attention_mask=scoring_mask,
+        past_key_values=scoring_cache,
+        position_ids=position_ids,
+        cache_position=cache_position,
+        use_cache=True,
+        output_attentions=True,
+        return_dict=True,
+    )
+    attentions = getattr(outputs, "attentions", None)
+    if attentions is None:
+        return attentions
+    return tuple(
+        attn[..., :logical_seq_len] if torch.is_tensor(attn) and attn.ndim == 4 else attn
+        for attn in attentions
+    )
+
+
 def synchronize_if_cuda(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -647,10 +709,8 @@ def generate(
     input_ids = encoded.input_ids.to(device)
     prefill_attention_mask = getattr(encoded, "attention_mask", torch.ones_like(input_ids)).to(device)
     logical_seq_len = int(input_ids.shape[1])
-    output_attentions = (not dense) and config.score_method in ("attention", "snapkv")
+    needs_attention_scores = (not dense) and config.score_method in ("attention", "snapkv")
     original_attn_impl = getattr(model.config, "_attn_implementation", None)
-    if output_attentions and original_attn_impl is not None:
-        model.config._attn_implementation = "eager"
 
     synchronize_if_cuda(device)
     start = time.perf_counter()
@@ -659,7 +719,7 @@ def generate(
             input_ids=input_ids,
             attention_mask=prefill_attention_mask,
             use_cache=True,
-            output_attentions=output_attentions,
+            output_attentions=False,
             return_dict=True,
         )
         past_key_values = prefill_outputs.past_key_values
@@ -675,18 +735,37 @@ def generate(
             "compression_overhead_sec": 0.0,
         }
         if not dense:
+            scoring_attentions = None
+            scoring_overhead_sec = 0.0
+            if needs_attention_scores:
+                scoring_start = time.perf_counter()
+                if original_attn_impl is not None:
+                    model.config._attn_implementation = "eager"
+                scoring_attentions = snapkv_scoring_attentions(
+                    model=model,
+                    input_ids=input_ids,
+                    attention_mask=prefill_attention_mask,
+                    past_key_values=past_key_values,
+                    logical_seq_len=logical_seq_len,
+                    observation_window=config.observation_window,
+                    device=device,
+                )
+                synchronize_if_cuda(device)
+                scoring_overhead_sec = time.perf_counter() - scoring_start
+                if original_attn_impl is not None:
+                    model.config._attn_implementation = "sdpa"
             compression_start = time.perf_counter()
             past_key_values, compression_stats = compress_past_key_values(
                 past_key_values,
                 config,
-                getattr(prefill_outputs, "attentions", None),
+                scoring_attentions,
             )
             compression_stats["compression_overhead_sec"] = time.perf_counter() - compression_start
-            compression_stats["scoring_overhead_sec"] = 0.0
-            if output_attentions:
+            compression_stats["scoring_overhead_sec"] = scoring_overhead_sec
+            if needs_attention_scores:
                 compression_stats["scoring_note"] = (
-                    "SnapKV/attention scoring used attention weights returned by the prefill pass; "
-                    "its overhead is included in TTFT rather than measured as a separate extra pass."
+                    "SnapKV/attention scoring uses a short post-prefill scoring pass over the "
+                    "last observation_window query tokens, avoiding full prefill attention weights."
                 )
                 if getattr(model.config, "_attn_implementation", None) == "eager":
                     # Eager attention is needed for attention weights during
@@ -747,7 +826,7 @@ def generate(
         generated.append(int(next_token.item()))
 
     total_time = ttft + sum(decode_times)
-    if output_attentions and original_attn_impl is not None:
+    if needs_attention_scores and original_attn_impl is not None:
         model.config._attn_implementation = original_attn_impl
     generated_text = tokenizer.decode(generated, skip_special_tokens=True)
     generated_tensor = torch.tensor(generated, dtype=input_ids.dtype)
